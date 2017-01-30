@@ -2628,6 +2628,9 @@ static void gen_ldst_i32(TCGOpcode opc, TCGv_i32 val, TCGv addr,
         tcg_gen_op3(&tcg_ctx, opc, GET_TCGV_I32(val), GET_TCGV_I64(addr), oi);
     }
 #endif
+#ifdef CONFIG_FULL_TRACE
+    gen_helper_addresstrace32(addr, val);
+#endif
 }
 
 static void gen_ldst_i64(TCGOpcode opc, TCGv_i64 val, TCGv addr,
@@ -2647,6 +2650,9 @@ static void gen_ldst_i64(TCGOpcode opc, TCGv_i64 val, TCGv addr,
     } else {
         tcg_gen_op3i_i64(opc, val, addr, oi);
     }
+#endif
+#ifdef CONFIG_FULL_TRACE
+    gen_helper_addresstrace64(addr, val);
 #endif
 }
 

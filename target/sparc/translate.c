@@ -102,9 +102,9 @@ typedef struct {
     TCGv c1, c2;
 } DisasCompare;
 
-#if defined(CONFIG_FULL_TRACE) && defined(TARGET_SPARC64)
+/*#if defined(CONFIG_FULL_TRACE) && defined(TARGET_SPARC64)
 #error "Full tracing is not implemented for SPARC64. Reconfigure with --disable-full-trace"
-#endif
+#endif*/
 
 // This function uses non-native bit order
 #define GET_FIELD(X, FROM, TO)                                  \
@@ -3159,7 +3159,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
 #ifdef CONFIG_FULL_TRACE
     TCGv_i32 const_pc = tcg_const_i32(dc->pc);
     TCGv_i32 const_iword = tcg_const_i32(insn);
-
     gen_helper_instructiontrace(const_pc, const_iword);
 #endif
 
@@ -5315,23 +5314,14 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                 case 0x0:       /* ld, V9 lduw, load unsigned word */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_ld32u(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x1:       /* ldub, load unsigned byte */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_ld8u(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace8(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x2:       /* lduh, load unsigned halfword */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_ld16u(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace16(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x3:       /* ldd, load double word */
                     if (rd & 1)
@@ -5342,9 +5332,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         gen_address_mask(dc, cpu_addr);
                         t64 = tcg_temp_new_i64();
                         tcg_gen_qemu_ld64(t64, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                       	gen_helper_addresstrace64(cpu_env, cpu_addr, t64);
-#endif
                         tcg_gen_trunc_i64_tl(cpu_val, t64);
                         tcg_gen_ext32u_tl(cpu_val, cpu_val);
                         gen_store_gpr(dc, rd + 1, cpu_val);
@@ -5357,22 +5344,13 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                 case 0x9:       /* ldsb, load signed byte */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_ld8s(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace8(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0xa:       /* ldsh, load signed halfword */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_ld16s(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace16(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0xd:       /* ldstub */
                     gen_ldstub(dc, cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x0f:
                     /* swap, swap register with memory. Also atomically */
@@ -5382,54 +5360,33 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                              dc->mem_idx, MO_TEUL);
 #ifdef CONFIG_FULL_TRACE
 		    /* The traced address is the one loaded from memory */
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
+                    gen_helper_addresstrace0(cpu_addr);
 #endif
                     break;
 #if !defined(CONFIG_USER_ONLY) || defined(TARGET_SPARC64)
                 case 0x10:      /* lda, V9 lduwa, load word alternate */
                     gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_TEUL);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x11:      /* lduba, load unsigned byte alternate */
                     gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_UB);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace8(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x12:      /* lduha, load unsigned halfword alternate */
                     gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_TEUW);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace16(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x13:      /* ldda, load double word alternate */
                     if (rd & 1) {
                         goto illegal_insn;
                     }
                     gen_ldda_asi(dc, cpu_addr, insn, rd);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace0(cpu_env, cpu_addr);
-#endif
                     goto skip_move;
                 case 0x19:      /* ldsba, load signed byte alternate */
                     gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_SB);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace8(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x1a:      /* ldsha, load signed halfword alternate */
                     gen_ld_asi(dc, cpu_val, cpu_addr, insn, MO_TESW);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace16(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x1d:      /* ldstuba -- XXX: should be atomically */
                     gen_ldstub_asi(dc, cpu_val, cpu_addr, insn);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x1f:      /* swapa, swap reg with alt. memory. Also
                                    atomically */
@@ -5437,7 +5394,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_src1 = gen_load_gpr(dc, rd);
                     gen_swap_asi(dc, cpu_val, cpu_src1, cpu_addr, insn);
 #ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
+                    gen_helper_addresstrace0(cpu_addr);
 #endif
                     break;
 
@@ -5507,9 +5464,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_dst_32 = gen_dest_fpr_F(dc);
                     tcg_gen_qemu_ld_i32(cpu_dst_32, cpu_addr,
                                         dc->mem_idx, MO_TEUL);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_dst_32);
-#endif
                     gen_store_fpr_F(dc, rd, cpu_dst_32);
                     break;
                 case 0x21:      /* ldfsr, V9 ldxfsr */
@@ -5535,9 +5489,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_src1_64 = tcg_temp_new_i64();
                     tcg_gen_qemu_ld_i64(cpu_src1_64, cpu_addr, dc->mem_idx,
                                         MO_TEQ | MO_ALIGN_4);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace0(cpu_env, cpu_addr);
-#endif
                     tcg_gen_addi_tl(cpu_addr, cpu_addr, 8);
                     cpu_src2_64 = tcg_temp_new_i64();
                     tcg_gen_qemu_ld_i64(cpu_src2_64, cpu_addr, dc->mem_idx,
@@ -5551,9 +5502,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_dst_64 = gen_dest_fpr_D(dc, rd);
                     tcg_gen_qemu_ld_i64(cpu_dst_64, cpu_addr, dc->mem_idx,
                                         MO_TEQ | MO_ALIGN_4);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace64(cpu_env, cpu_addr, cpu_dst_64);
-#endif
                     gen_store_fpr_D(dc, rd, cpu_dst_64);
                     break;
                 default:
@@ -5567,23 +5515,14 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                 case 0x4: /* st, store word */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_st32(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x5: /* stb, store byte */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_st8(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace8(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x6: /* sth, store halfword */
                     gen_address_mask(dc, cpu_addr);
                     tcg_gen_qemu_st16(cpu_val, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace16(cpu_env, cpu_addr, cpu_val);
-#endif
                     break;
                 case 0x7: /* std, store double word */
                     if (rd & 1)
@@ -5597,9 +5536,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         t64 = tcg_temp_new_i64();
                         tcg_gen_concat_tl_i64(t64, lo, cpu_val);
                         tcg_gen_qemu_st64(t64, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                        gen_helper_addresstrace64(cpu_env, cpu_addr, t64);
-#endif
                         tcg_temp_free_i64(t64);
                     }
                     break;
@@ -5642,9 +5578,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_src1_32 = gen_load_fpr_F(dc, rd);
                     tcg_gen_qemu_st_i32(cpu_src1_32, cpu_addr,
                                         dc->mem_idx, MO_TEUL);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_src1_32);
-#endif
                     break;
                 case 0x25: /* stfsr, V9 stxfsr */
                     {
@@ -5652,16 +5585,10 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                         gen_address_mask(dc, cpu_addr);
                         if (rd == 1) {
                             tcg_gen_qemu_st64(cpu_fsr, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                            gen_helper_addresstrace64(cpu_env, cpu_addr, cpu_fsr);
-#endif
                             break;
                         }
 #endif
                         tcg_gen_qemu_st32(cpu_fsr, cpu_addr, dc->mem_idx);
-#ifdef CONFIG_FULL_TRACE
-                        gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_fsr);
-#endif
                     }
                     break;
                 case 0x26:
@@ -5700,9 +5627,6 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_src1_64 = gen_load_fpr_D(dc, rd);
                     tcg_gen_qemu_st_i64(cpu_src1_64, cpu_addr, dc->mem_idx,
                                         MO_TEQ | MO_ALIGN_4);
-#ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace64(cpu_env, cpu_addr, cpu_src1_64);
-#endif
                     break;
                 default:
                     goto illegal_insn;
@@ -5752,7 +5676,7 @@ static void disas_sparc_insn(DisasContext * dc, unsigned int insn)
                     cpu_src2 = gen_load_gpr(dc, rs2);
                     gen_cas_asi(dc, cpu_addr, cpu_src2, insn, rd);
 #ifdef CONFIG_FULL_TRACE
-                    gen_helper_addresstrace32(cpu_env, cpu_addr, cpu_src2);
+                    gen_helper_addresstrace(cpu_addr, cpu_src2);
 #endif
                     break;
 #endif
@@ -6066,23 +5990,35 @@ void helper_instructiontrace(uint32_t pc, uint32_t iword) {
 	fprintf(stderr, "\n%.8x %.8x", pc, iword);
 }
 
-void helper_addresstrace0(CPUSPARCState *env, target_ulong address) {
+void helper_addresstrace0(target_ulong address) {
+#if TARGET_LONG_BITS == 32
 	fprintf(stderr, " %.8x ?", address);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx ?", address);
+#endif
 }
 
-void helper_addresstrace8(CPUSPARCState *env, target_ulong address, uint32_t data) {
-	fprintf(stderr, " %.8x %.2x", address, data);
-}
-
-void helper_addresstrace16(CPUSPARCState *env, target_ulong address, uint32_t data) {
-	fprintf(stderr, " %.8x %.4x", address, data);
-}
-
-void helper_addresstrace32(CPUSPARCState *env, target_ulong address, uint32_t data) {
+void helper_addresstrace(target_ulong address, target_ulong data) {
+#if TARGET_LONG_BITS == 32
 	fprintf(stderr, " %.8x %.8x", address, data);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx %.16lx", address, data);
+#endif
 }
 
-void helper_addresstrace64(CPUSPARCState *env, target_ulong address, uint64_t data) {
+void helper_addresstrace32(target_ulong address, uint32_t data) {
+#if TARGET_LONG_BITS == 32
+	fprintf(stderr, " %.8x %.8x", address, data);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx %.8x", address, data);
+#endif
+}
+
+void helper_addresstrace64(target_ulong address, uint64_t data) {
+#if TARGET_LONG_BITS == 32
 	fprintf(stderr, " %.8x %.16lx", address, data);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx %.16lx", address, data);
+#endif
 }
 #endif
