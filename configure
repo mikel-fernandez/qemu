@@ -321,6 +321,7 @@ numa=""
 tcmalloc="no"
 jemalloc="no"
 replication="yes"
+fulltrace="no"
 
 # parse CC options first
 for opt do
@@ -1170,6 +1171,10 @@ for opt do
   ;;
   --enable-replication) replication="yes"
   ;;
+  --disable-full-trace) fulltrace="no"
+  ;;
+  --enable-full-trace) fulltrace="yes"
+  ;;
   *)
       echo "ERROR: unknown option $opt"
       echo "Try '$0 --help' for more information"
@@ -1403,6 +1408,7 @@ disabled with --disable-FEATURE, default is enabled if available:
   tcmalloc        tcmalloc support
   jemalloc        jemalloc support
   replication     replication support
+  full-trace      full instruction and data trace support
 
 NOTE: The object files are built at the place where configure is launched
 EOF
@@ -5114,6 +5120,7 @@ echo "tcmalloc support  $tcmalloc"
 echo "jemalloc support  $jemalloc"
 echo "avx2 optimization $avx2_opt"
 echo "replication support $replication"
+echo "fulltrace support $fulltrace"
 
 if test "$sdl_too_old" = "yes"; then
 echo "-> Your SDL version is too old - please upgrade to have SDL support"
@@ -5713,6 +5720,10 @@ fi
 
 if test "$replication" = "yes" ; then
   echo "CONFIG_REPLICATION=y" >> $config_host_mak
+fi
+
+if test "$fulltrace" = "yes" ; then
+  echo "CONFIG_FULL_TRACE=y" >> $config_host_mak
 fi
 
 if test "$have_af_vsock" = "yes" ; then
