@@ -208,3 +208,41 @@ void helper_fixup_thrm(CPUPPCState *env)
         env->spr[i] = v;
     }
 }
+
+#ifdef CONFIG_FULL_TRACE
+void helper_instructiontrace(uint32_t pc, uint32_t iword) {
+	fprintf(stderr, "\n%.8x %.8x", pc, iword);
+}
+
+void helper_addresstrace0(target_ulong address) {
+#if TARGET_LONG_BITS == 32
+	fprintf(stderr, " %.8x ?", address);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx ?", address);
+#endif
+}
+
+void helper_addresstrace(target_ulong address, target_ulong data) {
+#if TARGET_LONG_BITS == 32
+	fprintf(stderr, " %.8x %.8x", address, data);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx %.16lx", address, data);
+#endif
+}
+
+void helper_addresstrace32(target_ulong address, uint32_t data) {
+#if TARGET_LONG_BITS == 32
+	fprintf(stderr, " %.8x %.8x", address, data);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx %.8x", address, data);
+#endif
+}
+
+void helper_addresstrace64(target_ulong address, uint64_t data) {
+#if TARGET_LONG_BITS == 32
+	fprintf(stderr, " %.8x %.16lx", address, data);
+#elif TARGET_LONG_BITS == 64
+	fprintf(stderr, " %.16lx %.16lx", address, data);
+#endif
+}
+#endif

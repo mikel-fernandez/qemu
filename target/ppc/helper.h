@@ -735,3 +735,10 @@ DEF_HELPER_4(dscliq, void, env, fprp, fprp, i32)
 
 DEF_HELPER_1(tbegin, void, env)
 DEF_HELPER_FLAGS_1(fixup_thrm, TCG_CALL_NO_RWG, void, env)
+#if defined(CONFIG_FULL_TRACE)
+DEF_HELPER_1(addresstrace0, void, tl)
+DEF_HELPER_2(addresstrace, void, tl, tl)
+DEF_HELPER_2(addresstrace32, void, tl, i32)
+DEF_HELPER_2(addresstrace64, void, tl, i64)
+DEF_HELPER_2(instructiontrace, void, i32, i32)
+#endif
