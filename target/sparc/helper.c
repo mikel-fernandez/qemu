@@ -252,102 +252,38 @@ void helper_power_down(CPUSPARCState *env)
 #endif
 
 #ifdef CONFIG_FULL_TRACE
-typedef struct dtrace_entry {
-	target_ulong address;
-	target_ulong data;
-	struct dtrace_entry *next;
-} dtrace_entry;
-
-typedef struct itrace_entry {
+#define BINARY_TRACE
+#define TRACE_BUFFER_SIZE 1
+typedef struct trace_entry {
 	uint32_t pc;
 	uint32_t iword;
-	struct dtrace_entry *d;
-} itrace_entry;
+	target_ulong data_addr;
+} trace_entry;
 
-#define ITRACE_BUFFER_SIZE 1024
-#define DTRACE_BUFFER_SIZE 1024
-itrace_entry itrace_buffer[ITRACE_BUFFER_SIZE];
-dtrace_entry dtrace_buffer[DTRACE_BUFFER_SIZE];
 
-uint32_t itrace_head, dtrace_head = 0;
+int32_t trace_head = -1;
+trace_entry trace_buffer[TRACE_BUFFER_SIZE];
 
-void itrace_flush(uint32_t size);
-void itrace_flush(uint32_t size) {
-	uint32_t i, j;
-	for (i=0; i < size; i++) {
-		uint8_t data_values = 0;
-		dtrace_entry *d = itrace_buffer[i].d;
-		if (itrace_buffer[i].d) {
-			data_values++;
-			while (d->next) {
-				data_values++;
-				d = d->next;
-			}
-		}
-		fwrite(&data_values, sizeof(uint8_t), 1, stderr);
-		fwrite(&itrace_buffer[i], sizeof(uint32_t), 2, stderr);
-		d = itrace_buffer[i].d;
-		for (j=0; j<data_values; j++) {
-			fwrite(&d, sizeof(target_ulong), 2, stderr);
-			d = d->next;
-		}
-	}
+void trace_flush(uint32_t size);
+void trace_flush(uint32_t size) {
+	fwrite(trace_buffer, sizeof(trace_entry), size, stderr);
 }
 
 void itrace_add(uint32_t pc, uint32_t iword);
 void itrace_add(uint32_t pc, uint32_t iword) {
-	if (itrace_head >= ITRACE_BUFFER_SIZE) {
-		itrace_flush(ITRACE_BUFFER_SIZE);
-		itrace_head = 0;
-		dtrace_head = 0;
+	trace_head++;
+	if (trace_head >= TRACE_BUFFER_SIZE) {
+		trace_flush(TRACE_BUFFER_SIZE);
+		trace_head = 0;
 	}
-	itrace_buffer[itrace_head].pc = pc;
-	itrace_buffer[itrace_head].iword = iword;
-	itrace_buffer[itrace_head].iword = iword;
-	itrace_buffer[itrace_head].d = NULL;
-	itrace_head++;
+	trace_buffer[trace_head].pc = pc;
+	trace_buffer[trace_head].iword = iword;
+	trace_buffer[trace_head].data_addr = (target_ulong)-1;
 }
 
-void itrace_copy(uint32_t source);
-void itrace_copy(uint32_t source) {
-	dtrace_head = 0;
-	itrace_buffer[0].pc = itrace_buffer[source].pc;
-	itrace_buffer[0].iword = itrace_buffer[source].iword;
-	if (itrace_buffer[source].d) {
-		itrace_buffer[0].d = &dtrace_buffer[dtrace_head++];
-		itrace_buffer[0].d->address = itrace_buffer[source].d->address;
-		itrace_buffer[0].d->data = itrace_buffer[source].d->data;
-		itrace_buffer[0].d->next = NULL;
-		dtrace_entry *s = itrace_buffer[source].d;
-		dtrace_entry *d = itrace_buffer[0].d;
-		while (s->next) {
-			s = s->next;
-			d->next = &dtrace_buffer[dtrace_head++];
-			d = d->next;
-			d->address = s->address;
-			d->data = s->data;
-			d->next = NULL;
-		}
-	}
-	itrace_head= 1;
-}
-void dtrace_add(target_ulong address, target_ulong data);
-void dtrace_add(target_ulong address, target_ulong data) {
-	if (dtrace_head >= DTRACE_BUFFER_SIZE) {
-		itrace_flush(itrace_head);
-		itrace_copy(itrace_head);
-	}
-	dtrace_entry *n = itrace_buffer[itrace_head].d;
-	if (!n) {
-		n = itrace_buffer[itrace_head].d = &dtrace_buffer[dtrace_head];
-	}
-	while (n->next) {
-		n = n->next;
-	}
-	n->next = &dtrace_buffer[dtrace_head++];
-	n->next->address = address;
-	n->next->data = data;
-	n->next->next = NULL;
+void dtrace_add(target_ulong address);
+void dtrace_add(target_ulong address) {
+	trace_buffer[trace_head].data_addr = address;
 }
 
 static int64_t instr_count = 0;
@@ -371,6 +307,7 @@ void helper_instructiontrace(uint32_t pc, uint32_t iword) {
 	if (skip_first_inst <= instr_count++) {
 		// Do not log an instruction twice. This seems to
 		// happen with save and restore instructions
+#ifndef BINARY_TRACE
 		if (prev_pc != 0xFFFFFFFF && pc != prev_pc) {
 			fprintf(stderr, "\n%.8x %.8x", pc, iword);
 		}
@@ -381,53 +318,71 @@ void helper_instructiontrace(uint32_t pc, uint32_t iword) {
 		if (trace_limit > 0 && ++traced_instr_count >= trace_limit) {
 			exit(0);
 		}
-	/*	itrace_add(pc, iword);
-		if (++instr_count == 10000000)
-			exit(0);*/
+#else
+		if (pc != prev_pc) {
+			itrace_add(pc, iword);
+		}
+		prev_pc = pc;
+		if (trace_limit > 0 && traced_instr_count++ >= trace_limit) {
+			exit(0);
+		}
+#endif
 	}
 }
 
 void helper_addresstrace0(target_ulong address) {
-	if (skip_first_inst >= instr_count++) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE 
 #if TARGET_LONG_BITS == 32
 		fprintf(stderr, " %.8x ?", address);
 #elif TARGET_LONG_BITS == 64
 		fprintf(stderr, " %.16lx ?", address);
 #endif
-	//	dtrace_add(address, 0);
+#else
+		dtrace_add(address);
+#endif
 	}
 }
 
 void helper_addresstrace(target_ulong address, target_ulong data) {
-	if (skip_first_inst >= instr_count++) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE
 #if TARGET_LONG_BITS == 32
 		fprintf(stderr, " %.8x %.8x", address, data);
 #elif TARGET_LONG_BITS == 64
 		fprintf(stderr, " %.16lx %.16lx", address, data);
 #endif
-	//	dtrace_add(address, data);
+#else
+		dtrace_add(address);
+#endif
 	}
 }
 
 void helper_addresstrace32(target_ulong address, uint32_t data) {
-	if (skip_first_inst >= instr_count++) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE
 #if TARGET_LONG_BITS == 32
 		fprintf(stderr, " %.8x %.8x", address, data);
 #elif TARGET_LONG_BITS == 64
 		fprintf(stderr, " %.16lx %.8x", address, data);
 #endif
-	//	dtrace_add(address, data);
+#else
+		dtrace_add(address);
+#endif
 	}
 }
 
 void helper_addresstrace64(target_ulong address, uint64_t data) {
-	if (skip_first_inst >= instr_count++) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE
 #if TARGET_LONG_BITS == 32
 		fprintf(stderr, " %.8x %.16lx", address, data);
 #elif TARGET_LONG_BITS == 64
 		fprintf(stderr, " %.16lx %.16lx", address, data);
 #endif
-	//	dtrace_add(address, data);
+#else
+		dtrace_add(address);
+#endif
 	}
 }
 #endif
