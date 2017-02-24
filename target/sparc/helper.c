@@ -293,7 +293,7 @@ static int64_t skip_first_inst = -1;
 static int64_t trace_limit = -1;
 
 void helper_instructiontrace(uint32_t pc, uint32_t iword) {
-	// First, we check if skip_first_inst and stop_after_tracing
+	// First, we check if skip_first_inst and trace_limit 
 	// have been initialized from environment variables
 	if (skip_first_inst == -1) {
 		char *tmp = getenv("QEMU_SKIP_FIRST_INST");
@@ -325,6 +325,7 @@ void helper_instructiontrace(uint32_t pc, uint32_t iword) {
 		}
 		prev_pc = pc;
 		if (trace_limit > 0 && traced_instr_count > trace_limit) {
+			trace_flush(trace_head);
 			exit(0);
 		}
 #endif
