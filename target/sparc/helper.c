@@ -253,7 +253,7 @@ void helper_power_down(CPUSPARCState *env)
 
 #ifdef CONFIG_FULL_TRACE
 #define BINARY_TRACE
-#define TRACE_BUFFER_SIZE 1
+#define TRACE_BUFFER_SIZE 1024
 typedef struct trace_entry {
 	uint32_t pc;
 	uint32_t iword;
@@ -321,9 +321,10 @@ void helper_instructiontrace(uint32_t pc, uint32_t iword) {
 #else
 		if (pc != prev_pc) {
 			itrace_add(pc, iword);
+			traced_instr_count++;
 		}
 		prev_pc = pc;
-		if (trace_limit > 0 && traced_instr_count++ >= trace_limit) {
+		if (trace_limit > 0 && traced_instr_count > trace_limit) {
 			exit(0);
 		}
 #endif
