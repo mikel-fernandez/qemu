@@ -350,47 +350,84 @@ void dtrace_add(target_ulong address, target_ulong data) {
 	n->next->next = NULL;
 }
 
-//static int instr_count = 0;
+static int64_t instr_count = 0;
+static int64_t traced_instr_count = 0;
+static uint32_t prev_pc = 0xFFFFFFFF;
+static int64_t skip_first_inst = -1;
+static int64_t trace_limit = -1;
+
 void helper_instructiontrace(uint32_t pc, uint32_t iword) {
-	fprintf(stderr, "\n%.8x %.8x", pc, iword);
-/*	itrace_add(pc, iword);
-	if (++instr_count == 10000000)
-		exit(0);*/
+	// First, we check if skip_first_inst and stop_after_tracing
+	// have been initialized from environment variables
+	if (skip_first_inst == -1) {
+		char *tmp = getenv("QEMU_SKIP_FIRST_INST");
+		skip_first_inst = tmp? atoi(tmp): 0;
+	}
+	if (trace_limit == -1) {
+		char *tmp = getenv("QEMU_TRACE_LIMIT");
+		trace_limit = tmp? atoi(tmp): 0;
+	}
+
+	if (skip_first_inst <= instr_count++) {
+		// Do not log an instruction twice. This seems to
+		// happen with save and restore instructions
+		if (prev_pc != 0xFFFFFFFF && pc != prev_pc) {
+			fprintf(stderr, "\n%.8x %.8x", pc, iword);
+		}
+		else if (prev_pc == 0xFFFFFFFF) {
+			fprintf(stderr, "%.8x %.8x", pc, iword);
+		}
+		prev_pc = pc;
+		if (trace_limit > 0 && ++traced_instr_count >= trace_limit) {
+			exit(0);
+		}
+	/*	itrace_add(pc, iword);
+		if (++instr_count == 10000000)
+			exit(0);*/
+	}
 }
 
 void helper_addresstrace0(target_ulong address) {
+	if (skip_first_inst >= instr_count++) {
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x ?", address);
+		fprintf(stderr, " %.8x ?", address);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx ?", address);
+		fprintf(stderr, " %.16lx ?", address);
 #endif
-//	dtrace_add(address, 0);
+	//	dtrace_add(address, 0);
+	}
 }
 
 void helper_addresstrace(target_ulong address, target_ulong data) {
+	if (skip_first_inst >= instr_count++) {
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x %.8x", address, data);
+		fprintf(stderr, " %.8x %.8x", address, data);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx %.16lx", address, data);
+		fprintf(stderr, " %.16lx %.16lx", address, data);
 #endif
-//	dtrace_add(address, data);
+	//	dtrace_add(address, data);
+	}
 }
 
 void helper_addresstrace32(target_ulong address, uint32_t data) {
+	if (skip_first_inst >= instr_count++) {
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x %.8x", address, data);
+		fprintf(stderr, " %.8x %.8x", address, data);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx %.8x", address, data);
+		fprintf(stderr, " %.16lx %.8x", address, data);
 #endif
-//	dtrace_add(address, data);
+	//	dtrace_add(address, data);
+	}
 }
 
 void helper_addresstrace64(target_ulong address, uint64_t data) {
+	if (skip_first_inst >= instr_count++) {
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x %.16lx", address, data);
+		fprintf(stderr, " %.8x %.16lx", address, data);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx %.16lx", address, data);
+		fprintf(stderr, " %.16lx %.16lx", address, data);
 #endif
-//	dtrace_add(address, data);
+	//	dtrace_add(address, data);
+	}
 }
 #endif
