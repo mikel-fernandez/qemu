@@ -253,7 +253,10 @@ void helper_power_down(CPUSPARCState *env)
 
 #ifdef CONFIG_FULL_TRACE
 #define BINARY_TRACE
-#define TRACE_BUFFER_SIZE 1024
+#define TRACE_BUFFER_SIZE 512
+
+static FILE * output_fd = NULL;
+
 typedef struct trace_entry {
 	uint32_t pc;
 	uint32_t iword;
@@ -266,7 +269,20 @@ trace_entry trace_buffer[TRACE_BUFFER_SIZE];
 
 void trace_flush(uint32_t size);
 void trace_flush(uint32_t size) {
-	fwrite(trace_buffer, sizeof(trace_entry), size, stderr);
+	if (!output_fd) {
+		char *tmp = getenv("QEMU_TRACE_OUTPUT");
+		if (!tmp) {
+			output_fd = stderr;
+		}
+		else {
+			output_fd = fopen(tmp, "w");
+			if (!output_fd) {
+				printf("Failed to open file descriptor for writting: %s\n", tmp);
+				exit(1);
+			}
+		}
+	}
+	fwrite(trace_buffer, sizeof(trace_entry), size, output_fd);
 }
 
 void itrace_add(uint32_t pc, uint32_t iword);
