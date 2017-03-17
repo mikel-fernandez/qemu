@@ -7107,6 +7107,12 @@ void gen_intermediate_code(CPUPPCState *env, struct TranslationBlock *tb)
         } else {
             ctx.opcode = cpu_ldl_code(env, ctx.nip);
         }
+ 
+#ifdef CONFIG_FULL_TRACE
+    TCGv_i32 const_pc = tcg_const_i32(ctxp->nip);
+    TCGv_i32 const_iword = tcg_const_i32(ctxp->opcode);
+    gen_helper_instructiontrace(const_pc, const_iword);
+#endif
         LOG_DISAS("translate opcode %08x (%02x %02x %02x %02x) (%s)\n",
                   ctx.opcode, opc1(ctx.opcode), opc2(ctx.opcode),
                   opc3(ctx.opcode), opc4(ctx.opcode),

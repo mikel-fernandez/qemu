@@ -210,39 +210,154 @@ void helper_fixup_thrm(CPUPPCState *env)
 }
 
 #ifdef CONFIG_FULL_TRACE
+#define BINARY_TRACE
+#define TRACE_BUFFER_SIZE 512
+static FILE * output_fd = NULL;
+
+typedef struct trace_entry {
+	uint32_t pc;
+	uint32_t iword;
+	target_ulong data_addr;
+} trace_entry;
+
+
+int32_t trace_head = -1;
+trace_entry trace_buffer[TRACE_BUFFER_SIZE];
+
+void trace_flush(uint32_t size);
+void trace_flush(uint32_t size) {
+	if (!output_fd) {
+		char *tmp = getenv("QEMU_TRACE_OUTPUT");
+		if (!tmp) {
+			output_fd = stderr;
+		}
+		else {
+			output_fd = fopen(tmp, "w");
+			if (!output_fd) {
+				printf("Failed to open file descriptor for writting: %s\n", tmp);
+				exit(1);
+			}
+		}
+	}
+	fwrite(trace_buffer, sizeof(trace_entry), size, output_fd);
+}
+
+void itrace_add(uint32_t pc, uint32_t iword);
+void itrace_add(uint32_t pc, uint32_t iword) {
+	trace_head++;
+	if (trace_head >= TRACE_BUFFER_SIZE) {
+		trace_flush(TRACE_BUFFER_SIZE);
+		trace_head = 0;
+	}
+	trace_buffer[trace_head].pc = pc;
+	trace_buffer[trace_head].iword = iword;
+	trace_buffer[trace_head].data_addr = (target_ulong)-1;
+}
+
+void dtrace_add(target_ulong address);
+void dtrace_add(target_ulong address) {
+	trace_buffer[trace_head].data_addr = address;
+}
+
+static int64_t instr_count = 0;
+static int64_t traced_instr_count = 0;
+static uint32_t prev_pc = 0xFFFFFFFF;
+static int64_t skip_first_inst = -1;
+static int64_t trace_limit = -1;
+
 void helper_instructiontrace(uint32_t pc, uint32_t iword) {
-	fprintf(stderr, "\n%.8x %.8x", pc, iword);
+	// First, we check if skip_first_inst and trace_limit 
+	// have been initialized from environment variables
+	if (skip_first_inst == -1) {
+		char *tmp = getenv("QEMU_SKIP_FIRST_INST");
+		skip_first_inst = tmp? atoi(tmp): 0;
+	}
+	if (trace_limit == -1) {
+		char *tmp = getenv("QEMU_TRACE_LIMIT");
+		trace_limit = tmp? atoi(tmp): 0;
+	}
+
+	if (skip_first_inst <= instr_count++) {
+		// Do not log an instruction twice. This seems to
+		// happen with save and restore instructions
+#ifndef BINARY_TRACE
+		if (prev_pc != 0xFFFFFFFF && pc != prev_pc) {
+			fprintf(stderr, "\n%.8x %.8x", pc, iword);
+		}
+		else if (prev_pc == 0xFFFFFFFF) {
+			fprintf(stderr, "%.8x %.8x", pc, iword);
+		}
+		prev_pc = pc;
+		if (trace_limit > 0 && ++traced_instr_count >= trace_limit) {
+			exit(0);
+		}
+#else
+		if (pc != prev_pc) {
+			itrace_add(pc, iword);
+			traced_instr_count++;
+		}
+		prev_pc = pc;
+		if (trace_limit > 0 && traced_instr_count > trace_limit) {
+			trace_flush(trace_head);
+			exit(0);
+		}
+#endif
+	}
 }
 
 void helper_addresstrace0(target_ulong address) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE 
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x ?", address);
+		fprintf(stderr, " %.8x ?", address);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx ?", address);
+		fprintf(stderr, " %.16lx ?", address);
 #endif
+#else
+		dtrace_add(address);
+#endif
+	}
 }
 
 void helper_addresstrace(target_ulong address, target_ulong data) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x %.8x", address, data);
+		fprintf(stderr, " %.8x %.8x", address, data);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx %.16lx", address, data);
+		fprintf(stderr, " %.16lx %.16lx", address, data);
 #endif
+#else
+		dtrace_add(address);
+#endif
+	}
 }
 
 void helper_addresstrace32(target_ulong address, uint32_t data) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x %.8x", address, data);
+		fprintf(stderr, " %.8x %.8x", address, data);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx %.8x", address, data);
+		fprintf(stderr, " %.16lx %.8x", address, data);
 #endif
+#else
+		dtrace_add(address);
+#endif
+	}
 }
 
 void helper_addresstrace64(target_ulong address, uint64_t data) {
+	if (skip_first_inst <= instr_count++) {
+#ifndef BINARY_TRACE
 #if TARGET_LONG_BITS == 32
-	fprintf(stderr, " %.8x %.16lx", address, data);
+		fprintf(stderr, " %.8x %.16lx", address, data);
 #elif TARGET_LONG_BITS == 64
-	fprintf(stderr, " %.16lx %.16lx", address, data);
+		fprintf(stderr, " %.16lx %.16lx", address, data);
 #endif
+#else
+		dtrace_add(address);
+#endif
+	}
 }
 #endif
