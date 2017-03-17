@@ -24,7 +24,7 @@
 #include "qemu/bitops.h"
 #include "qemu/error-report.h"
 #include "qom/object.h"
-#include "trace.h"
+#include "trace-root.h"
 
 #include "exec/memory-internal.h"
 #include "exec/ram_addr.h"
@@ -917,6 +917,8 @@ void memory_region_transaction_commit(void)
     AddressSpace *as;
 
     assert(memory_region_transaction_depth);
+    assert(qemu_mutex_iothread_locked());
+
     --memory_region_transaction_depth;
     if (!memory_region_transaction_depth) {
         if (memory_region_update_pending) {
@@ -1180,7 +1182,7 @@ static void memory_region_ram_device_write(void *opaque, hwaddr addr,
 static const MemoryRegionOps ram_device_mem_ops = {
     .read = memory_region_ram_device_read,
     .write = memory_region_ram_device_write,
-    .endianness = DEVICE_NATIVE_ENDIAN,
+    .endianness = DEVICE_HOST_ENDIAN,
     .valid = {
         .min_access_size = 1,
         .max_access_size = 8,
@@ -2371,8 +2373,13 @@ void memory_listener_register(MemoryListener *listener, AddressSpace *as)
 
 void memory_listener_unregister(MemoryListener *listener)
 {
+    if (!listener->address_space) {
+        return;
+    }
+
     QTAILQ_REMOVE(&memory_listeners, listener, link);
     QTAILQ_REMOVE(&listener->address_space->listeners, listener, link_as);
+    listener->address_space = NULL;
 }
 
 void address_space_init(AddressSpace *as, MemoryRegion *root, const char *name)
@@ -2450,6 +2457,21 @@ void address_space_destroy(AddressSpace *as)
     call_rcu(as, do_address_space_destroy, rcu);
 }
 
+static const char *memory_region_type(MemoryRegion *mr)
+{
+    if (memory_region_is_ram_device(mr)) {
+        return "ramd";
+    } else if (memory_region_is_romd(mr)) {
+        return "romd";
+    } else if (memory_region_is_rom(mr)) {
+        return "rom";
+    } else if (memory_region_is_ram(mr)) {
+        return "ram";
+    } else {
+        return "i/o";
+    }
+}
+
 typedef struct MemoryRegionList MemoryRegionList;
 
 struct MemoryRegionList {
@@ -2458,6 +2480,10 @@ struct MemoryRegionList {
 };
 
 typedef QTAILQ_HEAD(queue, MemoryRegionList) MemoryRegionListHead;
+
+#define MR_SIZE(size) (int128_nz(size) ? (hwaddr)int128_get64( \
+                           int128_sub((size), int128_one())) : 0)
+#define MTREE_INDENT "  "
 
 static void mtree_print_mr(fprintf_function mon_printf, void *f,
                            const MemoryRegion *mr, unsigned int level,
@@ -2468,13 +2494,26 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
     MemoryRegionListHead submr_print_queue;
     const MemoryRegion *submr;
     unsigned int i;
+    hwaddr cur_start, cur_end;
 
     if (!mr) {
         return;
     }
 
     for (i = 0; i < level; i++) {
-        mon_printf(f, "  ");
+        mon_printf(f, MTREE_INDENT);
+    }
+
+    cur_start = base + mr->addr;
+    cur_end = cur_start + MR_SIZE(mr->size);
+
+    /*
+     * Try to detect overflow of memory region. This should never
+     * happen normally. When it happens, we dump something to warn the
+     * user who is observing this.
+     */
+    if (cur_start < base || cur_end < cur_start) {
+        mon_printf(f, "[DETECTED OVERFLOW!] ");
     }
 
     if (mr->alias) {
@@ -2494,37 +2533,22 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
             QTAILQ_INSERT_TAIL(alias_print_queue, ml, queue);
         }
         mon_printf(f, TARGET_FMT_plx "-" TARGET_FMT_plx
-                   " (prio %d, %c%c): alias %s @%s " TARGET_FMT_plx
+                   " (prio %d, %s): alias %s @%s " TARGET_FMT_plx
                    "-" TARGET_FMT_plx "%s\n",
-                   base + mr->addr,
-                   base + mr->addr
-                   + (int128_nz(mr->size) ?
-                      (hwaddr)int128_get64(int128_sub(mr->size,
-                                                      int128_one())) : 0),
+                   cur_start, cur_end,
                    mr->priority,
-                   mr->romd_mode ? 'R' : '-',
-                   !mr->readonly && !(mr->rom_device && mr->romd_mode) ? 'W'
-                                                                       : '-',
+                   memory_region_type((MemoryRegion *)mr),
                    memory_region_name(mr),
                    memory_region_name(mr->alias),
                    mr->alias_offset,
-                   mr->alias_offset
-                   + (int128_nz(mr->size) ?
-                      (hwaddr)int128_get64(int128_sub(mr->size,
-                                                      int128_one())) : 0),
+                   mr->alias_offset + MR_SIZE(mr->size),
                    mr->enabled ? "" : " [disabled]");
     } else {
         mon_printf(f,
-                   TARGET_FMT_plx "-" TARGET_FMT_plx " (prio %d, %c%c): %s%s\n",
-                   base + mr->addr,
-                   base + mr->addr
-                   + (int128_nz(mr->size) ?
-                      (hwaddr)int128_get64(int128_sub(mr->size,
-                                                      int128_one())) : 0),
+                   TARGET_FMT_plx "-" TARGET_FMT_plx " (prio %d, %s): %s%s\n",
+                   cur_start, cur_end,
                    mr->priority,
-                   mr->romd_mode ? 'R' : '-',
-                   !mr->readonly && !(mr->rom_device && mr->romd_mode) ? 'W'
-                                                                       : '-',
+                   memory_region_type((MemoryRegion *)mr),
                    memory_region_name(mr),
                    mr->enabled ? "" : " [disabled]");
     }
@@ -2549,7 +2573,7 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
     }
 
     QTAILQ_FOREACH(ml, &submr_print_queue, queue) {
-        mtree_print_mr(mon_printf, f, ml->mr, level + 1, base + mr->addr,
+        mtree_print_mr(mon_printf, f, ml->mr, level + 1, cur_start,
                        alias_print_queue);
     }
 
@@ -2558,11 +2582,61 @@ static void mtree_print_mr(fprintf_function mon_printf, void *f,
     }
 }
 
-void mtree_info(fprintf_function mon_printf, void *f)
+static void mtree_print_flatview(fprintf_function p, void *f,
+                                 AddressSpace *as)
+{
+    FlatView *view = address_space_get_flatview(as);
+    FlatRange *range = &view->ranges[0];
+    MemoryRegion *mr;
+    int n = view->nr;
+
+    if (n <= 0) {
+        p(f, MTREE_INDENT "No rendered FlatView for "
+          "address space '%s'\n", as->name);
+        flatview_unref(view);
+        return;
+    }
+
+    while (n--) {
+        mr = range->mr;
+        if (range->offset_in_region) {
+            p(f, MTREE_INDENT TARGET_FMT_plx "-"
+              TARGET_FMT_plx " (prio %d, %s): %s @" TARGET_FMT_plx "\n",
+              int128_get64(range->addr.start),
+              int128_get64(range->addr.start) + MR_SIZE(range->addr.size),
+              mr->priority,
+              range->readonly ? "rom" : memory_region_type(mr),
+              memory_region_name(mr),
+              range->offset_in_region);
+        } else {
+            p(f, MTREE_INDENT TARGET_FMT_plx "-"
+              TARGET_FMT_plx " (prio %d, %s): %s\n",
+              int128_get64(range->addr.start),
+              int128_get64(range->addr.start) + MR_SIZE(range->addr.size),
+              mr->priority,
+              range->readonly ? "rom" : memory_region_type(mr),
+              memory_region_name(mr));
+        }
+        range++;
+    }
+
+    flatview_unref(view);
+}
+
+void mtree_info(fprintf_function mon_printf, void *f, bool flatview)
 {
     MemoryRegionListHead ml_head;
     MemoryRegionList *ml, *ml2;
     AddressSpace *as;
+
+    if (flatview) {
+        QTAILQ_FOREACH(as, &address_spaces, address_spaces_link) {
+            mon_printf(f, "address-space (flat view): %s\n", as->name);
+            mtree_print_flatview(mon_printf, f, as);
+            mon_printf(f, "\n");
+        }
+        return;
+    }
 
     QTAILQ_INIT(&ml_head);
 

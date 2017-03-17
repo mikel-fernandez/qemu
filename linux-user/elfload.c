@@ -967,6 +967,63 @@ static void elf_core_copy_regs(target_elf_gregset_t *regs, const CPUMBState *env
 
 #endif /* TARGET_MICROBLAZE */
 
+#ifdef TARGET_NIOS2
+
+#define ELF_START_MMAP 0x80000000
+
+#define elf_check_arch(x) ((x) == EM_ALTERA_NIOS2)
+
+#define ELF_CLASS   ELFCLASS32
+#define ELF_ARCH    EM_ALTERA_NIOS2
+
+static void init_thread(struct target_pt_regs *regs, struct image_info *infop)
+{
+    regs->ea = infop->entry;
+    regs->sp = infop->start_stack;
+    regs->estatus = 0x3;
+}
+
+#define ELF_EXEC_PAGESIZE        4096
+
+#define USE_ELF_CORE_DUMP
+#define ELF_NREG 49
+typedef target_elf_greg_t target_elf_gregset_t[ELF_NREG];
+
+/* See linux kernel: arch/mips/kernel/process.c:elf_dump_regs.  */
+static void elf_core_copy_regs(target_elf_gregset_t *regs,
+                               const CPUNios2State *env)
+{
+    int i;
+
+    (*regs)[0] = -1;
+    for (i = 1; i < 8; i++)    /* r0-r7 */
+        (*regs)[i] = tswapreg(env->regs[i + 7]);
+
+    for (i = 8; i < 16; i++)   /* r8-r15 */
+        (*regs)[i] = tswapreg(env->regs[i - 8]);
+
+    for (i = 16; i < 24; i++)  /* r16-r23 */
+        (*regs)[i] = tswapreg(env->regs[i + 7]);
+    (*regs)[24] = -1;    /* R_ET */
+    (*regs)[25] = -1;    /* R_BT */
+    (*regs)[26] = tswapreg(env->regs[R_GP]);
+    (*regs)[27] = tswapreg(env->regs[R_SP]);
+    (*regs)[28] = tswapreg(env->regs[R_FP]);
+    (*regs)[29] = tswapreg(env->regs[R_EA]);
+    (*regs)[30] = -1;    /* R_SSTATUS */
+    (*regs)[31] = tswapreg(env->regs[R_RA]);
+
+    (*regs)[32] = tswapreg(env->regs[R_PC]);
+
+    (*regs)[33] = -1; /* R_STATUS */
+    (*regs)[34] = tswapreg(env->regs[CR_ESTATUS]);
+
+    for (i = 35; i < 49; i++)    /* ... */
+        (*regs)[i] = -1;
+}
+
+#endif /* TARGET_NIOS2 */
+
 #ifdef TARGET_OPENRISC
 
 #define ELF_START_MMAP 0x08000000
@@ -997,9 +1054,8 @@ static void elf_core_copy_regs(target_elf_gregset_t *regs,
     for (i = 0; i < 32; i++) {
         (*regs)[i] = tswapreg(env->gpr[i]);
     }
-
     (*regs)[32] = tswapreg(env->pc);
-    (*regs)[33] = tswapreg(env->sr);
+    (*regs)[33] = tswapreg(cpu_get_sr(env));
 }
 #define ELF_HWCAP 0
 #define ELF_PLATFORM NULL
@@ -2206,6 +2262,7 @@ static int symcmp(const void *s0, const void *s1)
 static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
 {
     int i, shnum, nsyms, sym_idx = 0, str_idx = 0;
+    uint64_t segsz;
     struct elf_shdr *shdr;
     char *strings = NULL;
     struct syminfo *s = NULL;
@@ -2237,19 +2294,26 @@ static void load_symbols(struct elfhdr *hdr, int fd, abi_ulong load_bias)
         goto give_up;
     }
 
-    i = shdr[str_idx].sh_size;
-    s->disas_strtab = strings = g_try_malloc(i);
-    if (!strings || pread(fd, strings, i, shdr[str_idx].sh_offset) != i) {
+    segsz = shdr[str_idx].sh_size;
+    s->disas_strtab = strings = g_try_malloc(segsz);
+    if (!strings ||
+        pread(fd, strings, segsz, shdr[str_idx].sh_offset) != segsz) {
         goto give_up;
     }
 
-    i = shdr[sym_idx].sh_size;
-    syms = g_try_malloc(i);
-    if (!syms || pread(fd, syms, i, shdr[sym_idx].sh_offset) != i) {
+    segsz = shdr[sym_idx].sh_size;
+    syms = g_try_malloc(segsz);
+    if (!syms || pread(fd, syms, segsz, shdr[sym_idx].sh_offset) != segsz) {
         goto give_up;
     }
 
-    nsyms = i / sizeof(struct elf_sym);
+    if (segsz / sizeof(struct elf_sym) > INT_MAX) {
+        /* Implausibly large symbol table: give up rather than ploughing
+         * on with the number of symbols calculation overflowing
+         */
+        goto give_up;
+    }
+    nsyms = segsz / sizeof(struct elf_sym);
     for (i = 0; i < nsyms; ) {
         bswap_sym(syms + i);
         /* Throw away entries which we do not need.  */

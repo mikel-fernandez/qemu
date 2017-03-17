@@ -73,7 +73,6 @@ struct PCMachineState {
     /* CPU and apic information: */
     bool apic_xrupt_override;
     unsigned apic_id_limit;
-    CPUArchIdList *possible_cpus;
     uint16_t boot_cpus;
 
     /* NUMA information: */
@@ -181,7 +180,7 @@ void parallel_hds_isa_init(ISABus *bus, int n);
 
 bool parallel_mm_init(MemoryRegion *address_space,
                       hwaddr base, int it_shift, qemu_irq irq,
-                      CharDriverState *chr);
+                      Chardev *chr);
 
 /* i8259.c */
 
@@ -381,6 +380,21 @@ bool e820_get_entry(int, uint32_t, uint64_t *, uint64_t *);
         .property = "x-mach-use-reliable-get-clock",\
         .value    = "off",\
     },\
+    {\
+        .driver   = "ICH9-LPC",\
+        .property = "x-smi-broadcast",\
+        .value    = "off",\
+    },\
+    {\
+        .driver   = TYPE_X86_CPU,\
+        .property = "vmware-cpuid-freq",\
+        .value    = "off",\
+    },\
+    {\
+        .driver   = "Haswell-" TYPE_X86_CPU,\
+        .property = "stepping",\
+        .value    = "1",\
+    },
 
 #define PC_COMPAT_2_7 \
     HW_COMPAT_2_7 \
@@ -614,6 +628,10 @@ bool e820_get_entry(int, uint32_t, uint64_t *, uint64_t *);
         .driver   = "Broadwell-noTSX" "-" TYPE_X86_CPU,\
         .property = "xlevel",\
         .value    = stringify(0x8000000a),\
+    },{\
+        .driver = TYPE_X86_CPU,\
+        .property = "kvm-no-smi-migration",\
+        .value    = "on",\
     },
 
 #define PC_COMPAT_2_2 \

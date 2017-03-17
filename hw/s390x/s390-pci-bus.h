@@ -183,8 +183,8 @@ enum ZpciIoatDtype {
  *          may enter an error state
  * blocked: ignore all DMA and interrupts; transition back to enabled or from
  *          error state via mpcifc
- * error: an error occured; transition back to enabled via mpcifc
- * permanent error: an unrecoverable error occured; transition to standby via
+ * error: an error occurred; transition back to enabled via mpcifc
+ * permanent error: an unrecoverable error occurred; transition to standby via
  *                  sclp deconfigure
  */
 typedef enum {
@@ -279,7 +279,7 @@ typedef struct S390PCIIOMMUTable {
     S390PCIIOMMU *iommu[PCI_SLOT_MAX];
 } S390PCIIOMMUTable;
 
-typedef struct S390PCIBusDevice {
+struct S390PCIBusDevice {
     DeviceState qdev;
     PCIDevice *pdev;
     ZpciState state;
@@ -301,7 +301,7 @@ typedef struct S390PCIBusDevice {
     IndAddr *indicator;
     QEMUTimer *release_timer;
     QTAILQ_ENTRY(S390PCIBusDevice) link;
-} S390PCIBusDevice;
+};
 
 typedef struct S390PCIBus {
     BusState qbus;

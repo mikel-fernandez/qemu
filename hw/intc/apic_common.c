@@ -251,6 +251,8 @@ static void apic_reset_common(DeviceState *dev)
     s->apicbase = APIC_DEFAULT_ADDRESS | bsp | MSR_IA32_APICBASE_ENABLE;
     s->id = s->initial_apic_id;
 
+    apic_reset_irq_delivered();
+
     s->vapic_paddr = 0;
     info->vapic_base_update(s);
 
@@ -329,7 +331,7 @@ static void apic_common_realize(DeviceState *dev, Error **errp)
         instance_id = -1;
     }
     vmstate_register_with_alias_id(NULL, instance_id, &vmstate_apic_common,
-                                   s, -1, 0);
+                                   s, -1, 0, NULL);
 }
 
 static void apic_common_unrealize(DeviceState *dev, Error **errp)
@@ -385,6 +387,25 @@ static bool apic_common_sipi_needed(void *opaque)
     return s->wait_for_sipi != 0;
 }
 
+static bool apic_irq_delivered_needed(void *opaque)
+{
+    APICCommonState *s = APIC_COMMON(opaque);
+    return s->cpu == X86_CPU(first_cpu) && apic_irq_delivered != 0;
+}
+
+static void apic_irq_delivered_pre_save(void *opaque)
+{
+    APICCommonState *s = APIC_COMMON(opaque);
+    s->apic_irq_delivered = apic_irq_delivered;
+}
+
+static int apic_irq_delivered_post_load(void *opaque, int version_id)
+{
+    APICCommonState *s = APIC_COMMON(opaque);
+    apic_irq_delivered = s->apic_irq_delivered;
+    return 0;
+}
+
 static const VMStateDescription vmstate_apic_common_sipi = {
     .name = "apic_sipi",
     .version_id = 1,
@@ -393,6 +414,19 @@ static const VMStateDescription vmstate_apic_common_sipi = {
     .fields = (VMStateField[]) {
         VMSTATE_INT32(sipi_vector, APICCommonState),
         VMSTATE_INT32(wait_for_sipi, APICCommonState),
+        VMSTATE_END_OF_LIST()
+    }
+};
+
+static const VMStateDescription vmstate_apic_irq_delivered = {
+    .name = "apic_irq_delivered",
+    .version_id = 1,
+    .minimum_version_id = 1,
+    .needed = apic_irq_delivered_needed,
+    .pre_save = apic_irq_delivered_pre_save,
+    .post_load = apic_irq_delivered_post_load,
+    .fields = (VMStateField[]) {
+        VMSTATE_INT32(apic_irq_delivered, APICCommonState),
         VMSTATE_END_OF_LIST()
     }
 };
@@ -431,6 +465,7 @@ static const VMStateDescription vmstate_apic_common = {
     },
     .subsections = (const VMStateDescription*[]) {
         &vmstate_apic_common_sipi,
+        &vmstate_apic_irq_delivered,
         NULL
     }
 };
