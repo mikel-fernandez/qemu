@@ -377,7 +377,7 @@ static void curl_multi_check_completion(BDRVCURLState *s)
                     }
 
                     qemu_mutex_unlock(&s->mutex);
-                    acb->common.cb(acb->common.opaque, -EPROTO);
+                    acb->common.cb(acb->common.opaque, -EIO);
                     qemu_mutex_lock(&s->mutex);
                     qemu_aio_unref(acb);
                     state->acb[i] = NULL;
@@ -659,6 +659,7 @@ static int curl_open(BlockDriverState *bs, QDict *options, int flags,
     const char *cookie;
     double d;
     const char *secretid;
+    const char *protocol_delimiter;
 
     static int inited = 0;
 
@@ -697,6 +698,15 @@ static int curl_open(BlockDriverState *bs, QDict *options, int flags,
     file = qemu_opt_get(opts, CURL_BLOCK_OPT_URL);
     if (file == NULL) {
         error_setg(errp, "curl block driver requires an 'url' option");
+        goto out_noclean;
+    }
+
+    if (!strstart(file, bs->drv->protocol_name, &protocol_delimiter) ||
+        !strstart(protocol_delimiter, "://", NULL))
+    {
+        error_setg(errp, "%s curl driver cannot handle the URL '%s' (does not "
+                   "start with '%s://')", bs->drv->protocol_name, file,
+                   bs->drv->protocol_name);
         goto out_noclean;
     }
 

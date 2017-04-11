@@ -129,10 +129,13 @@ static void vnc_init_basic_info(SocketAddress *addr,
         info->family = NETWORK_ADDRESS_FAMILY_UNIX;
         break;
 
-    default:
-        error_setg(errp, "Unsupported socket kind %d",
-                   addr->type);
+    case SOCKET_ADDRESS_KIND_VSOCK:
+    case SOCKET_ADDRESS_KIND_FD:
+        error_setg(errp, "Unsupported socket address type %s",
+                   SocketAddressKind_lookup[addr->type]);
         break;
+    default:
+        abort();
     }
 
     return;
@@ -411,10 +414,13 @@ VncInfo *qmp_query_vnc(Error **errp)
             info->family = NETWORK_ADDRESS_FAMILY_UNIX;
             break;
 
-        default:
-            error_setg(errp, "Unsupported socket kind %d",
-                       addr->type);
+        case SOCKET_ADDRESS_KIND_VSOCK:
+        case SOCKET_ADDRESS_KIND_FD:
+            error_setg(errp, "Unsupported socket address type %s",
+                       SocketAddressKind_lookup[addr->type]);
             goto out_error;
+        default:
+            abort();
         }
 
         info->has_host = true;
@@ -3401,6 +3407,7 @@ vnc_display_create_creds(bool x509,
 
 static int vnc_display_get_address(const char *addrstr,
                                    bool websocket,
+                                   bool reverse,
                                    int displaynum,
                                    int to,
                                    bool has_ipv4,
@@ -3480,21 +3487,22 @@ static int vnc_display_get_address(const char *addrstr,
                 inet->port = g_strdup(port);
             }
         } else {
+            int offset = reverse ? 0 : 5900;
             if (parse_uint_full(port, &baseport, 10) < 0) {
                 error_setg(errp, "can't convert to a number: %s", port);
                 goto cleanup;
             }
             if (baseport > 65535 ||
-                baseport + 5900 > 65535) {
+                baseport + offset > 65535) {
                 error_setg(errp, "port %s out of range", port);
                 goto cleanup;
             }
             inet->port = g_strdup_printf(
-                "%d", (int)baseport + 5900);
+                "%d", (int)baseport + offset);
 
             if (to) {
                 inet->has_to = true;
-                inet->to = to + 5900;
+                inet->to = to + offset;
             }
         }
 
@@ -3516,6 +3524,7 @@ static int vnc_display_get_address(const char *addrstr,
 }
 
 static int vnc_display_get_addresses(QemuOpts *opts,
+                                     bool reverse,
                                      SocketAddress ***retsaddr,
                                      size_t *retnsaddr,
                                      SocketAddress ***retwsaddr,
@@ -3555,7 +3564,7 @@ static int vnc_display_get_addresses(QemuOpts *opts,
     qemu_opt_iter_init(&addriter, opts, "vnc");
     while ((addr = qemu_opt_iter_next(&addriter)) != NULL) {
         int rv;
-        rv = vnc_display_get_address(addr, false, 0, to,
+        rv = vnc_display_get_address(addr, false, reverse, 0, to,
                                      has_ipv4, has_ipv6,
                                      ipv4, ipv6,
                                      &saddr, errp);
@@ -3580,7 +3589,7 @@ static int vnc_display_get_addresses(QemuOpts *opts,
 
     qemu_opt_iter_init(&addriter, opts, "websocket");
     while ((addr = qemu_opt_iter_next(&addriter)) != NULL) {
-        if (vnc_display_get_address(addr, true, displaynum, to,
+        if (vnc_display_get_address(addr, true, reverse, displaynum, to,
                                     has_ipv4, has_ipv6,
                                     ipv4, ipv6,
                                     &wsaddr, errp) < 0) {
@@ -3639,6 +3648,7 @@ static int vnc_display_connect(VncDisplay *vd,
         error_setg(errp, "Expected a single address in reverse mode");
         return -1;
     }
+    /* TODO SOCKET_ADDRESS_KIND_FD when fd has AF_UNIX */
     vd->is_unix = saddr[0]->type == SOCKET_ADDRESS_KIND_UNIX;
     sioc = qio_channel_socket_new();
     qio_channel_set_name(QIO_CHANNEL(sioc), "vnc-reverse");
@@ -3677,6 +3687,7 @@ static int vnc_display_listen_addr(VncDisplay *vd,
         qio_channel_set_name(QIO_CHANNEL(sioc), name);
         if (qio_channel_socket_listen_sync(
                 sioc, rawaddrs[i], listenerr == NULL ? &listenerr : NULL) < 0) {
+            object_unref(OBJECT(sioc));
             continue;
         }
         listening = true;
@@ -3776,13 +3787,10 @@ void vnc_display_open(const char *id, Error **errp)
         return;
     }
 
-    if (vnc_display_get_addresses(opts, &saddr, &nsaddr,
+    reverse = qemu_opt_get_bool(opts, "reverse", false);
+    if (vnc_display_get_addresses(opts, reverse, &saddr, &nsaddr,
                                   &wsaddr, &nwsaddr, errp) < 0) {
         goto fail;
-    }
-
-    if (saddr == NULL) {
-        return;
     }
 
     password = qemu_opt_get_bool(opts, "password", false);
@@ -3802,7 +3810,6 @@ void vnc_display_open(const char *id, Error **errp)
         }
     }
 
-    reverse = qemu_opt_get_bool(opts, "reverse", false);
     lock_key_sync = qemu_opt_get_bool(opts, "lock-key-sync", true);
     key_delay_ms = qemu_opt_get_number(opts, "key-delay-ms", 1);
     sasl = qemu_opt_get_bool(opts, "sasl", false);
@@ -3968,6 +3975,10 @@ void vnc_display_open(const char *id, Error **errp)
         unregister_displaychangelistener(&vd->dcl);
         vd->dcl.con = con;
         register_displaychangelistener(&vd->dcl);
+    }
+
+    if (saddr == NULL) {
+        goto cleanup;
     }
 
     if (reverse) {

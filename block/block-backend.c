@@ -61,10 +61,13 @@ struct BlockBackend {
 
     uint64_t perm;
     uint64_t shared_perm;
+    bool disable_perm;
 
     bool allow_write_beyond_eof;
 
     NotifierList remove_bs_notifiers, insert_bs_notifiers;
+
+    int quiesce_counter;
 };
 
 typedef struct BlockBackendAIOCB {
@@ -576,7 +579,7 @@ int blk_set_perm(BlockBackend *blk, uint64_t perm, uint64_t shared_perm,
 {
     int ret;
 
-    if (blk->root) {
+    if (blk->root && !blk->disable_perm) {
         ret = bdrv_child_try_set_perm(blk->root, perm, shared_perm, errp);
         if (ret < 0) {
             return ret;
@@ -595,15 +598,52 @@ void blk_get_perm(BlockBackend *blk, uint64_t *perm, uint64_t *shared_perm)
     *shared_perm = blk->shared_perm;
 }
 
+/*
+ * Notifies the user of all BlockBackends that migration has completed. qdev
+ * devices can tighten their permissions in response (specifically revoke
+ * shared write permissions that we needed for storage migration).
+ *
+ * If an error is returned, the VM cannot be allowed to be resumed.
+ */
+void blk_resume_after_migration(Error **errp)
+{
+    BlockBackend *blk;
+    Error *local_err = NULL;
+
+    for (blk = blk_all_next(NULL); blk; blk = blk_all_next(blk)) {
+        if (!blk->disable_perm) {
+            continue;
+        }
+
+        blk->disable_perm = false;
+
+        blk_set_perm(blk, blk->perm, blk->shared_perm, &local_err);
+        if (local_err) {
+            error_propagate(errp, local_err);
+            blk->disable_perm = true;
+            return;
+        }
+    }
+}
+
 static int blk_do_attach_dev(BlockBackend *blk, void *dev)
 {
     if (blk->dev) {
         return -EBUSY;
     }
+
+    /* While migration is still incoming, we don't need to apply the
+     * permissions of guest device BlockBackends. We might still have a block
+     * job or NBD server writing to the image for storage migration. */
+    if (runstate_check(RUN_STATE_INMIGRATE)) {
+        blk->disable_perm = true;
+    }
+
     blk_ref(blk);
     blk->dev = dev;
     blk->legacy_dev = false;
     blk_iostatus_reset(blk);
+
     return 0;
 }
 
@@ -699,12 +739,17 @@ void blk_set_dev_ops(BlockBackend *blk, const BlockDevOps *ops,
                      void *opaque)
 {
     /* All drivers that use blk_set_dev_ops() are qdevified and we want to keep
-     * it that way, so we can assume blk->dev is a DeviceState if blk->dev_ops
-     * is set. */
+     * it that way, so we can assume blk->dev, if present, is a DeviceState if
+     * blk->dev_ops is set. Non-device users may use dev_ops without device. */
     assert(!blk->legacy_dev);
 
     blk->dev_ops = ops;
     blk->dev_opaque = opaque;
+
+    /* Are we currently quiesced? Should we enforce this right now? */
+    if (blk->quiesce_counter && ops->drained_begin) {
+        ops->drained_begin(opaque);
+    }
 }
 
 /*
@@ -1870,6 +1915,12 @@ static void blk_root_drained_begin(BdrvChild *child)
 {
     BlockBackend *blk = child->opaque;
 
+    if (++blk->quiesce_counter == 1) {
+        if (blk->dev_ops && blk->dev_ops->drained_begin) {
+            blk->dev_ops->drained_begin(blk->dev_opaque);
+        }
+    }
+
     /* Note that blk->root may not be accessible here yet if we are just
      * attaching to a BlockDriverState that is drained. Use child instead. */
 
@@ -1881,7 +1932,14 @@ static void blk_root_drained_begin(BdrvChild *child)
 static void blk_root_drained_end(BdrvChild *child)
 {
     BlockBackend *blk = child->opaque;
+    assert(blk->quiesce_counter);
 
     assert(blk->public.io_limits_disabled);
     --blk->public.io_limits_disabled;
+
+    if (--blk->quiesce_counter == 0) {
+        if (blk->dev_ops && blk->dev_ops->drained_end) {
+            blk->dev_ops->drained_end(blk->dev_opaque);
+        }
+    }
 }

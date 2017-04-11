@@ -1772,6 +1772,8 @@ static void external_snapshot_prepare(BlkActionState *common,
         return;
     }
 
+    bdrv_set_aio_context(state->new_bs, state->aio_context);
+
     /* This removes our old bs and adds the new bs. This is an operation that
      * can fail, so we need to do it in .prepare; undoing it for abort is
      * always possible. */
@@ -1788,8 +1790,6 @@ static void external_snapshot_commit(BlkActionState *common)
 {
     ExternalSnapshotState *state =
                              DO_UPCAST(ExternalSnapshotState, common, common);
-
-    bdrv_set_aio_context(state->new_bs, state->aio_context);
 
     /* We don't need (or want) to use the transactional
      * bdrv_reopen_multiple() across all the entries at once, because we
@@ -2835,7 +2835,7 @@ void hmp_drive_del(Monitor *mon, const QDict *qdict)
 
     bs = bdrv_find_node(id);
     if (bs) {
-        qmp_x_blockdev_del(id, &local_err);
+        qmp_blockdev_del(id, &local_err);
         if (local_err) {
             error_report_err(local_err);
         }
@@ -3900,7 +3900,7 @@ fail:
     visit_free(v);
 }
 
-void qmp_x_blockdev_del(const char *node_name, Error **errp)
+void qmp_blockdev_del(const char *node_name, Error **errp)
 {
     AioContext *aio_context;
     BlockDriverState *bs;

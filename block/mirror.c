@@ -634,7 +634,8 @@ static int coroutine_fn mirror_dirty_init(MirrorBlockJob *s)
             }
 
             if (s->in_flight >= MAX_IN_FLIGHT) {
-                trace_mirror_yield(s, s->in_flight, s->buf_free_count, -1);
+                trace_mirror_yield(s, UINT64_MAX, s->buf_free_count,
+                                   s->in_flight);
                 mirror_wait_for_io(s);
                 continue;
             }
@@ -809,7 +810,7 @@ static void coroutine_fn mirror_run(void *opaque)
             s->common.iostatus == BLOCK_DEVICE_IO_STATUS_OK) {
             if (s->in_flight >= MAX_IN_FLIGHT || s->buf_free_count == 0 ||
                 (cnt == 0 && s->in_flight > 0)) {
-                trace_mirror_yield(s, s->in_flight, s->buf_free_count, cnt);
+                trace_mirror_yield(s, cnt, s->buf_free_count, s->in_flight);
                 mirror_wait_for_io(s);
                 continue;
             } else if (cnt != 0) {
@@ -1147,9 +1148,10 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
         return;
     }
     mirror_top_bs->total_sectors = bs->total_sectors;
+    bdrv_set_aio_context(mirror_top_bs, bdrv_get_aio_context(bs));
 
     /* bdrv_append takes ownership of the mirror_top_bs reference, need to keep
-     * it alive until block_job_create() even if bs has no parent. */
+     * it alive until block_job_create() succeeds even if bs has no parent. */
     bdrv_ref(mirror_top_bs);
     bdrv_drained_begin(bs);
     bdrv_append(mirror_top_bs, bs, &local_err);
@@ -1167,10 +1169,12 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
                          BLK_PERM_CONSISTENT_READ | BLK_PERM_WRITE_UNCHANGED |
                          BLK_PERM_WRITE | BLK_PERM_GRAPH_MOD, speed,
                          creation_flags, cb, opaque, errp);
-    bdrv_unref(mirror_top_bs);
     if (!s) {
         goto fail;
     }
+    /* The block job now has a reference to this node */
+    bdrv_unref(mirror_top_bs);
+
     s->source = bs;
     s->mirror_top_bs = mirror_top_bs;
 
@@ -1241,6 +1245,10 @@ static void mirror_start_job(const char *job_id, BlockDriverState *bs,
 
 fail:
     if (s) {
+        /* Make sure this BDS does not go away until we have completed the graph
+         * changes below */
+        bdrv_ref(mirror_top_bs);
+
         g_free(s->replaces);
         blk_unref(s->target);
         block_job_unref(&s->common);
@@ -1249,6 +1257,8 @@ fail:
     bdrv_child_try_set_perm(mirror_top_bs->backing, 0, BLK_PERM_ALL,
                             &error_abort);
     bdrv_replace_node(mirror_top_bs, backing_bs(mirror_top_bs), &error_abort);
+
+    bdrv_unref(mirror_top_bs);
 }
 
 void mirror_start(const char *job_id, BlockDriverState *bs,

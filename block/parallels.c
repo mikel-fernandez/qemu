@@ -114,7 +114,7 @@ static QemuOptsList parallels_runtime_opts = {
             .name = PARALLELS_OPT_PREALLOC_SIZE,
             .type = QEMU_OPT_SIZE,
             .help = "Preallocation size on image expansion",
-            .def_value_str = "128MiB",
+            .def_value_str = "128M",
         },
         {
             .name = PARALLELS_OPT_PREALLOC_MODE,
@@ -192,8 +192,7 @@ static int64_t allocate_clusters(BlockDriverState *bs, int64_t sector_num,
                                  int nb_sectors, int *pnum)
 {
     BDRVParallelsState *s = bs->opaque;
-    uint32_t idx, to_allocate, i;
-    int64_t pos, space;
+    int64_t pos, space, idx, to_allocate, i;
 
     pos = block_status(s, sector_num, nb_sectors, pnum);
     if (pos > 0) {
@@ -201,11 +200,19 @@ static int64_t allocate_clusters(BlockDriverState *bs, int64_t sector_num,
     }
 
     idx = sector_num / s->tracks;
-    if (idx >= s->bat_size) {
-        return -EINVAL;
-    }
-
     to_allocate = DIV_ROUND_UP(sector_num + *pnum, s->tracks) - idx;
+
+    /* This function is called only by parallels_co_writev(), which will never
+     * pass a sector_num at or beyond the end of the image (because the block
+     * layer never passes such a sector_num to that function). Therefore, idx
+     * is always below s->bat_size.
+     * block_status() will limit *pnum so that sector_num + *pnum will not
+     * exceed the image end. Therefore, idx + to_allocate cannot exceed
+     * s->bat_size.
+     * Note that s->bat_size is an unsigned int, therefore idx + to_allocate
+     * will always fit into a uint32_t. */
+    assert(idx < s->bat_size && idx + to_allocate <= s->bat_size);
+
     space = to_allocate * s->tracks;
     if (s->data_end + space > bdrv_getlength(bs->file->bs) >> BDRV_SECTOR_BITS) {
         int ret;
@@ -687,7 +694,8 @@ static int parallels_open(BlockDriverState *bs, QDict *options, int flags,
     if (local_err != NULL) {
         goto fail_options;
     }
-    if (!bdrv_has_zero_init(bs->file->bs) ||
+
+    if (!(flags & BDRV_O_RESIZE) || !bdrv_has_zero_init(bs->file->bs) ||
             bdrv_truncate(bs->file, bdrv_getlength(bs->file->bs)) != 0) {
         s->prealloc_mode = PRL_PREALLOC_MODE_FALLOCATE;
     }
