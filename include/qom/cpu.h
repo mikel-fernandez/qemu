@@ -24,7 +24,9 @@
 #include "disas/bfd.h"
 #include "exec/hwaddr.h"
 #include "exec/memattrs.h"
+#include "qapi/qapi-types-run-state.h"
 #include "qemu/bitmap.h"
+#include "qemu/rcu_queue.h"
 #include "qemu/queue.h"
 #include "qemu/thread.h"
 
@@ -85,8 +87,11 @@ struct TranslationBlock;
  * @has_work: Callback for checking if there is work to do.
  * @do_interrupt: Callback for interrupt handling.
  * @do_unassigned_access: Callback for unassigned access handling.
+ * (this is deprecated: new targets should use do_transaction_failed instead)
  * @do_unaligned_access: Callback for unaligned access handling, if
  * the target defines #ALIGNED_ONLY.
+ * @do_transaction_failed: Callback for handling failed memory transactions
+ * (ie bus faults or external aborts; not MMU faults)
  * @virtio_is_big_endian: Callback to return %true if a CPU which supports
  * runtime configurable endianness is currently big-endian. Non-configurable
  * CPUs can use the default implementation of this method. This method should
@@ -128,6 +133,9 @@ struct TranslationBlock;
  *           before the insn which triggers a watchpoint rather than after it.
  * @gdb_arch_name: Optional callback that returns the architecture name known
  * to GDB. The caller must free the returned string with g_free.
+ * @gdb_get_dynamic_xml: Callback to return dynamically generated XML for the
+ *   gdb stub. Returns a pointer to the XML contents for the specified XML file
+ *   or NULL if the CPU doesn't have a dynamically generated content for it.
  * @cpu_exec_enter: Callback for cpu_exec preparation.
  * @cpu_exec_exit: Callback for cpu_exec cleanup.
  * @cpu_exec_interrupt: Callback for processing interrupts in cpu_exec.
@@ -153,6 +161,10 @@ typedef struct CPUClass {
     void (*do_unaligned_access)(CPUState *cpu, vaddr addr,
                                 MMUAccessType access_type,
                                 int mmu_idx, uintptr_t retaddr);
+    void (*do_transaction_failed)(CPUState *cpu, hwaddr physaddr, vaddr addr,
+                                  unsigned size, MMUAccessType access_type,
+                                  int mmu_idx, MemTxAttrs attrs,
+                                  MemTxResult response, uintptr_t retaddr);
     bool (*virtio_is_big_endian)(CPUState *cpu);
     int (*memory_rw_debug)(CPUState *cpu, vaddr addr,
                            uint8_t *buf, int len, bool is_write);
@@ -167,7 +179,7 @@ typedef struct CPUClass {
                                Error **errp);
     void (*set_pc)(CPUState *cpu, vaddr value);
     void (*synchronize_from_tb)(CPUState *cpu, struct TranslationBlock *tb);
-    int (*handle_mmu_fault)(CPUState *cpu, vaddr address, int rw,
+    int (*handle_mmu_fault)(CPUState *cpu, vaddr address, int size, int rw,
                             int mmu_index);
     hwaddr (*get_phys_page_debug)(CPUState *cpu, vaddr addr);
     hwaddr (*get_phys_page_attrs_debug)(CPUState *cpu, vaddr addr,
@@ -188,17 +200,20 @@ typedef struct CPUClass {
                                 void *opaque);
 
     const struct VMStateDescription *vmsd;
-    int gdb_num_core_regs;
     const char *gdb_core_xml_file;
     gchar * (*gdb_arch_name)(CPUState *cpu);
-    bool gdb_stop_before_watchpoint;
-
+    const char * (*gdb_get_dynamic_xml)(CPUState *cpu, const char *xmlname);
     void (*cpu_exec_enter)(CPUState *cpu);
     void (*cpu_exec_exit)(CPUState *cpu);
     bool (*cpu_exec_interrupt)(CPUState *cpu, int interrupt_request);
 
     void (*disas_set_info)(CPUState *cpu, disassemble_info *info);
     vaddr (*adjust_watchpoint_address)(CPUState *cpu, vaddr addr, int len);
+    void (*tcg_initialize)(void);
+
+    /* Keep non-pointer data at the end to minimize holes.  */
+    int gdb_num_core_regs;
+    bool gdb_stop_before_watchpoint;
 } CPUClass;
 
 #ifdef HOST_WORDS_BIGENDIAN
@@ -258,13 +273,14 @@ typedef void (*run_on_cpu_func)(CPUState *cpu, run_on_cpu_data data);
 
 struct qemu_work_item;
 
+#define CPU_UNSET_NUMA_NODE_ID -1
+#define CPU_TRACE_DSTATE_MAX_EVENTS 32
+
 /**
  * CPUState:
  * @cpu_index: CPU index (informative).
  * @nr_cores: Number of cores within this CPU package.
  * @nr_threads: Number of threads within this CPU.
- * @numa_node: NUMA node this CPU is belonging to.
- * @host_tid: Host thread ID.
  * @running: #true if CPU is currently running (lockless).
  * @has_waiter: #true if a CPU is currently waiting for the cpu_exec_end;
  * valid under cpu_list_lock.
@@ -301,7 +317,12 @@ struct qemu_work_item;
  * @kvm_fd: vCPU file descriptor for KVM.
  * @work_mutex: Lock to prevent multiple access to queued_work_*.
  * @queued_work_first: First asynchronous work pending.
+ * @trace_dstate_delayed: Delayed changes to trace_dstate (includes all changes
+ *                        to @trace_dstate).
  * @trace_dstate: Dynamic tracing state of events for this vCPU (bitmask).
+ * @ignore_memory_transaction_failures: Cached copy of the MachineState
+ *    flag of the same name: allows the board to suppress calling of the
+ *    CPU do_transaction_failed hook function.
  *
  * State of one CPU core or thread.
  */
@@ -312,14 +333,12 @@ struct CPUState {
 
     int nr_cores;
     int nr_threads;
-    int numa_node;
 
     struct QemuThread *thread;
 #ifdef _WIN32
     HANDLE hThread;
 #endif
     int thread_id;
-    uint32_t host_tid;
     bool running, has_waiter;
     struct QemuCond *halt_cond;
     bool thread_kicked;
@@ -329,6 +348,7 @@ struct CPUState {
     bool unplug;
     bool crash_occurred;
     bool exit_request;
+    uint32_t cflags_next_tb;
     /* updates protected by BQL */
     uint32_t interrupt_request;
     int singlestep_enabled;
@@ -346,7 +366,7 @@ struct CPUState {
 
     void *env_ptr; /* CPUArchState */
 
-    /* Writes protected by tb_lock, reads not thread-safe  */
+    /* Accessed in parallel; all accesses must be atomic */
     struct TranslationBlock *tb_jmp_cache[TB_JMP_CACHE_SIZE];
 
     struct GDBRegisterState *gdb_regs;
@@ -367,29 +387,36 @@ struct CPUState {
      */
     uintptr_t mem_io_pc;
     vaddr mem_io_vaddr;
+    /*
+     * This is only needed for the legacy cpu_unassigned_access() hook;
+     * when all targets using it have been converted to use
+     * cpu_transaction_failed() instead it can be removed.
+     */
+    MMUAccessType mem_io_access_type;
 
     int kvm_fd;
-    bool kvm_vcpu_dirty;
     struct KVMState *kvm_state;
     struct kvm_run *kvm_run;
 
-    /*
-     * Used for events with 'vcpu' and *without* the 'disabled' properties.
-     * Dynamically allocated based on bitmap requried to hold up to
-     * trace_get_vcpu_event_count() entries.
-     */
-    unsigned long *trace_dstate;
+    /* Used for events with 'vcpu' and *without* the 'disabled' properties */
+    DECLARE_BITMAP(trace_dstate_delayed, CPU_TRACE_DSTATE_MAX_EVENTS);
+    DECLARE_BITMAP(trace_dstate, CPU_TRACE_DSTATE_MAX_EVENTS);
 
     /* TODO Move common fields from CPUArchState here. */
-    int cpu_index; /* used by alpha TCG */
-    uint32_t halted; /* used by alpha, cris, ppc TCG */
+    int cpu_index;
+    uint32_t halted;
     uint32_t can_do_io;
-    int32_t exception_index; /* used by m68k TCG */
+    int32_t exception_index;
+
+    /* shared by kvm, hax and hvf */
+    bool vcpu_dirty;
 
     /* Used to keep track of an outstanding cpu throttle thread for migration
      * autoconverge
      */
     bool throttle_thread_scheduled;
+
+    bool ignore_memory_transaction_failures;
 
     /* Note that this is accessed at the start of every TB via a negative
        offset from AREG0.  Leave this field at the end so as to make the
@@ -400,7 +427,6 @@ struct CPUState {
         icount_decr_u16 u16;
     } icount_decr;
 
-    bool hax_vcpu_dirty;
     struct hax_vcpu_state *hax_vcpu;
 
     /* The pending_tlb_flush flag is set and cleared atomically to
@@ -408,19 +434,31 @@ struct CPUState {
      * unnecessary flushes.
      */
     uint16_t pending_tlb_flush;
+
+    int hvf_fd;
+
+    /* track IOMMUs whose translations we've cached in the TCG TLB */
+    GArray *iommu_notifiers;
 };
 
 QTAILQ_HEAD(CPUTailQ, CPUState);
 extern struct CPUTailQ cpus;
-#define CPU_NEXT(cpu) QTAILQ_NEXT(cpu, node)
-#define CPU_FOREACH(cpu) QTAILQ_FOREACH(cpu, &cpus, node)
+#define first_cpu        QTAILQ_FIRST_RCU(&cpus)
+#define CPU_NEXT(cpu)    QTAILQ_NEXT_RCU(cpu, node)
+#define CPU_FOREACH(cpu) QTAILQ_FOREACH_RCU(cpu, &cpus, node)
 #define CPU_FOREACH_SAFE(cpu, next_cpu) \
-    QTAILQ_FOREACH_SAFE(cpu, &cpus, node, next_cpu)
-#define CPU_FOREACH_REVERSE(cpu) \
-    QTAILQ_FOREACH_REVERSE(cpu, &cpus, CPUTailQ, node)
-#define first_cpu QTAILQ_FIRST(&cpus)
+    QTAILQ_FOREACH_SAFE_RCU(cpu, &cpus, node, next_cpu)
 
 extern __thread CPUState *current_cpu;
+
+static inline void cpu_tb_jmp_cache_clear(CPUState *cpu)
+{
+    unsigned int i;
+
+    for (i = 0; i < TB_JMP_CACHE_SIZE; i++) {
+        atomic_set(&cpu->tb_jmp_cache[i], NULL);
+    }
+}
 
 /**
  * qemu_tcg_mttcg_enabled:
@@ -587,11 +625,13 @@ static inline hwaddr cpu_get_phys_page_debug(CPUState *cpu, vaddr addr)
 static inline int cpu_asidx_from_attrs(CPUState *cpu, MemTxAttrs attrs)
 {
     CPUClass *cc = CPU_GET_CLASS(cpu);
+    int ret = 0;
 
     if (cc->asidx_from_attrs) {
-        return cc->asidx_from_attrs(cpu, attrs);
+        ret = cc->asidx_from_attrs(cpu, attrs);
+        assert(ret < cpu->num_ases && ret >= 0);
     }
-    return 0;
+    return ret;
 }
 #endif
 
@@ -625,15 +665,25 @@ void cpu_reset(CPUState *cpu);
 ObjectClass *cpu_class_by_name(const char *typename, const char *cpu_model);
 
 /**
- * cpu_generic_init:
- * @typename: The CPU base type.
- * @cpu_model: The model string including optional parameters.
+ * cpu_create:
+ * @typename: The CPU type.
  *
- * Instantiates a CPU, processes optional parameters and realizes the CPU.
+ * Instantiates a CPU and realizes the CPU.
  *
  * Returns: A #CPUState or %NULL if an error occurred.
  */
-CPUState *cpu_generic_init(const char *typename, const char *cpu_model);
+CPUState *cpu_create(const char *typename);
+
+/**
+ * parse_cpu_model:
+ * @cpu_model: The model string including optional parameters.
+ *
+ * processes optional parameters and registers them as global properties
+ *
+ * Returns: type of CPU to create or prints error and terminates process
+ *          if an error occurred.
+ */
+const char *parse_cpu_model(const char *cpu_model);
 
 /**
  * cpu_has_work:
@@ -747,6 +797,16 @@ CPUState *qemu_get_cpu(int index);
 bool cpu_exists(int64_t id);
 
 /**
+ * cpu_by_arch_id:
+ * @id: Guest-exposed CPU ID of the CPU to obtain.
+ *
+ * Get a CPU with matching @id.
+ *
+ * Returns: The CPU or %NULL if there is no matching CPU.
+ */
+CPUState *cpu_by_arch_id(int64_t id);
+
+/**
  * cpu_throttle_set:
  * @new_throttle_pct: Percent of sleep time. Valid range is 1 to 99.
  *
@@ -807,6 +867,8 @@ void cpu_interrupt(CPUState *cpu, int mask);
 
 #endif /* USER_ONLY */
 
+#ifdef NEED_CPU_H
+
 #ifdef CONFIG_SOFTMMU
 static inline void cpu_unassigned_access(CPUState *cpu, hwaddr addr,
                                          bool is_write, bool is_exec,
@@ -827,7 +889,24 @@ static inline void cpu_unaligned_access(CPUState *cpu, vaddr addr,
 
     cc->do_unaligned_access(cpu, addr, access_type, mmu_idx, retaddr);
 }
+
+static inline void cpu_transaction_failed(CPUState *cpu, hwaddr physaddr,
+                                          vaddr addr, unsigned size,
+                                          MMUAccessType access_type,
+                                          int mmu_idx, MemTxAttrs attrs,
+                                          MemTxResult response,
+                                          uintptr_t retaddr)
+{
+    CPUClass *cc = CPU_GET_CLASS(cpu);
+
+    if (!cpu->ignore_memory_transaction_failures && cc->do_transaction_failed) {
+        cc->do_transaction_failed(cpu, physaddr, addr, size, access_type,
+                                  mmu_idx, attrs, response, retaddr);
+    }
+}
 #endif
+
+#endif /* NEED_CPU_H */
 
 /**
  * cpu_set_pc:
@@ -1001,9 +1080,12 @@ AddressSpace *cpu_get_address_space(CPUState *cpu, int asidx);
 
 void QEMU_NORETURN cpu_abort(CPUState *cpu, const char *fmt, ...)
     GCC_FMT_ATTR(2, 3);
+extern Property cpu_common_props[];
 void cpu_exec_initfn(CPUState *cpu);
 void cpu_exec_realizefn(CPUState *cpu, Error **errp);
 void cpu_exec_unrealizefn(CPUState *cpu);
+
+#ifdef NEED_CPU_H
 
 #ifdef CONFIG_SOFTMMU
 extern const struct VMStateDescription vmstate_cpu_common;
@@ -1018,6 +1100,8 @@ extern const struct VMStateDescription vmstate_cpu_common;
     .flags = VMS_STRUCT,                                                    \
     .offset = 0,                                                            \
 }
+
+#endif /* NEED_CPU_H */
 
 #define UNASSIGNED_CPU_INDEX -1
 

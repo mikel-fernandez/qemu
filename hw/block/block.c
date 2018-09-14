@@ -12,20 +12,8 @@
 #include "sysemu/block-backend.h"
 #include "hw/block/block.h"
 #include "qapi/error.h"
+#include "qapi/qapi-types-block.h"
 #include "qemu/error-report.h"
-
-void blkconf_serial(BlockConf *conf, char **serial)
-{
-    DriveInfo *dinfo;
-
-    if (!*serial) {
-        /* try to fall back to value set with legacy -drive serial=... */
-        dinfo = blk_legacy_dinfo(conf->blk);
-        if (dinfo) {
-            *serial = g_strdup(dinfo->serial);
-        }
-    }
-}
 
 void blkconf_blocksizes(BlockConf *conf)
 {
@@ -51,7 +39,7 @@ void blkconf_blocksizes(BlockConf *conf)
     }
 }
 
-void blkconf_apply_backend_options(BlockConf *conf, bool readonly,
+bool blkconf_apply_backend_options(BlockConf *conf, bool readonly,
                                    bool resizable, Error **errp)
 {
     BlockBackend *blk = conf->blk;
@@ -76,7 +64,7 @@ void blkconf_apply_backend_options(BlockConf *conf, bool readonly,
 
     ret = blk_set_perm(blk, perm, shared_perm, errp);
     if (ret < 0) {
-        return;
+        return false;
     }
 
     switch (conf->wce) {
@@ -99,26 +87,14 @@ void blkconf_apply_backend_options(BlockConf *conf, bool readonly,
 
     blk_set_enable_write_cache(blk, wce);
     blk_set_on_error(blk, rerror, werror);
+
+    return true;
 }
 
-void blkconf_geometry(BlockConf *conf, int *ptrans,
+bool blkconf_geometry(BlockConf *conf, int *ptrans,
                       unsigned cyls_max, unsigned heads_max, unsigned secs_max,
                       Error **errp)
 {
-    DriveInfo *dinfo;
-
-    if (!conf->cyls && !conf->heads && !conf->secs) {
-        /* try to fall back to value set with legacy -drive cyls=... */
-        dinfo = blk_legacy_dinfo(conf->blk);
-        if (dinfo) {
-            conf->cyls  = dinfo->cyls;
-            conf->heads = dinfo->heads;
-            conf->secs  = dinfo->secs;
-            if (ptrans) {
-                *ptrans = dinfo->trans;
-            }
-        }
-    }
     if (!conf->cyls && !conf->heads && !conf->secs) {
         hd_geometry_guess(conf->blk,
                           &conf->cyls, &conf->heads, &conf->secs,
@@ -129,15 +105,16 @@ void blkconf_geometry(BlockConf *conf, int *ptrans,
     if (conf->cyls || conf->heads || conf->secs) {
         if (conf->cyls < 1 || conf->cyls > cyls_max) {
             error_setg(errp, "cyls must be between 1 and %u", cyls_max);
-            return;
+            return false;
         }
         if (conf->heads < 1 || conf->heads > heads_max) {
             error_setg(errp, "heads must be between 1 and %u", heads_max);
-            return;
+            return false;
         }
         if (conf->secs < 1 || conf->secs > secs_max) {
             error_setg(errp, "secs must be between 1 and %u", secs_max);
-            return;
+            return false;
         }
     }
+    return true;
 }

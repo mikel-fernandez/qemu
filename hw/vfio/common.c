@@ -32,6 +32,7 @@
 #include "hw/hw.h"
 #include "qemu/error-report.h"
 #include "qemu/range.h"
+#include "sysemu/balloon.h"
 #include "sysemu/kvm.h"
 #include "trace.h"
 #include "qapi/error.h"
@@ -119,6 +120,9 @@ void vfio_region_write(void *opaque, hwaddr addr,
     case 4:
         buf.dword = cpu_to_le32(data);
         break;
+    case 8:
+        buf.qword = cpu_to_le64(data);
+        break;
     default:
         hw_error("vfio: unsupported write size, %d bytes", size);
         break;
@@ -173,6 +177,9 @@ uint64_t vfio_region_read(void *opaque,
     case 4:
         data = le32_to_cpu(buf.dword);
         break;
+    case 8:
+        data = le64_to_cpu(buf.qword);
+        break;
     default:
         hw_error("vfio: unsupported read size, %d bytes", size);
         break;
@@ -190,6 +197,14 @@ const MemoryRegionOps vfio_region_ops = {
     .read = vfio_region_read,
     .write = vfio_region_write,
     .endianness = DEVICE_LITTLE_ENDIAN,
+    .valid = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
+    .impl = {
+        .min_access_size = 1,
+        .max_access_size = 8,
+    },
 };
 
 /*
@@ -310,7 +325,8 @@ static bool vfio_get_vaddr(IOMMUTLBEntry *iotlb, void **vaddr,
      */
     mr = address_space_translate(&address_space_memory,
                                  iotlb->translated_addr,
-                                 &xlat, &len, writable);
+                                 &xlat, &len, writable,
+                                 MEMTXATTRS_UNSPECIFIED);
     if (!memory_region_is_ram(mr)) {
         error_report("iommu map to non memory area %"HWADDR_PRIx"",
                      xlat);
@@ -421,7 +437,6 @@ static void vfio_listener_region_add(MemoryListener *listener,
     end = int128_get64(int128_sub(llend, int128_one()));
 
     if (container->iommu_type == VFIO_SPAPR_TCE_v2_IOMMU) {
-        VFIOHostDMAWindow *hostwin;
         hwaddr pgsize = 0;
 
         /* For now intersections are not allowed, we may relax this later */
@@ -443,6 +458,33 @@ static void vfio_listener_region_add(MemoryListener *listener,
         vfio_host_win_add(container, section->offset_within_address_space,
                           section->offset_within_address_space +
                           int128_get64(section->size) - 1, pgsize);
+#ifdef CONFIG_KVM
+        if (kvm_enabled()) {
+            VFIOGroup *group;
+            IOMMUMemoryRegion *iommu_mr = IOMMU_MEMORY_REGION(section->mr);
+            struct kvm_vfio_spapr_tce param;
+            struct kvm_device_attr attr = {
+                .group = KVM_DEV_VFIO_GROUP,
+                .attr = KVM_DEV_VFIO_GROUP_SET_SPAPR_TCE,
+                .addr = (uint64_t)(unsigned long)&param,
+            };
+
+            if (!memory_region_iommu_get_attr(iommu_mr, IOMMU_ATTR_SPAPR_TCE_FD,
+                                              &param.tablefd)) {
+                QLIST_FOREACH(group, &container->group_list, container_next) {
+                    param.groupfd = group->fd;
+                    if (ioctl(vfio_kvm_device_fd, KVM_SET_DEVICE_ATTR, &attr)) {
+                        error_report("vfio: failed to setup fd %d "
+                                     "for a group with fd %d: %s",
+                                     param.tablefd, param.groupfd,
+                                     strerror(errno));
+                        return;
+                    }
+                    trace_vfio_spapr_group_attach(param.groupfd, param.tablefd);
+                }
+            }
+        }
+#endif
     }
 
     hostwin_found = false;
@@ -465,6 +507,8 @@ static void vfio_listener_region_add(MemoryListener *listener,
 
     if (memory_region_is_iommu(section->mr)) {
         VFIOGuestIOMMU *giommu;
+        IOMMUMemoryRegion *iommu_mr = IOMMU_MEMORY_REGION(section->mr);
+        int iommu_idx;
 
         trace_vfio_listener_region_add_iommu(iova, end);
         /*
@@ -474,16 +518,24 @@ static void vfio_listener_region_add(MemoryListener *listener,
          * device emulation the VFIO iommu handles to use).
          */
         giommu = g_malloc0(sizeof(*giommu));
-        giommu->iommu = section->mr;
+        giommu->iommu = iommu_mr;
         giommu->iommu_offset = section->offset_within_address_space -
                                section->offset_within_region;
         giommu->container = container;
-        giommu->n.notify = vfio_iommu_map_notify;
-        giommu->n.notifier_flags = IOMMU_NOTIFIER_ALL;
+        llend = int128_add(int128_make64(section->offset_within_region),
+                           section->size);
+        llend = int128_sub(llend, int128_one());
+        iommu_idx = memory_region_iommu_attrs_to_index(iommu_mr,
+                                                       MEMTXATTRS_UNSPECIFIED);
+        iommu_notifier_init(&giommu->n, vfio_iommu_map_notify,
+                            IOMMU_NOTIFIER_ALL,
+                            section->offset_within_region,
+                            int128_get64(llend),
+                            iommu_idx);
         QLIST_INSERT_HEAD(&container->giommu_list, giommu, giommu_next);
 
-        memory_region_register_iommu_notifier(giommu->iommu, &giommu->n);
-        memory_region_iommu_replay(giommu->iommu, &giommu->n, false);
+        memory_region_register_iommu_notifier(section->mr, &giommu->n);
+        memory_region_iommu_replay(giommu->iommu, &giommu->n);
 
         return;
     }
@@ -498,18 +550,39 @@ static void vfio_listener_region_add(MemoryListener *listener,
 
     llsize = int128_sub(llend, int128_make64(iova));
 
+    if (memory_region_is_ram_device(section->mr)) {
+        hwaddr pgmask = (1ULL << ctz64(hostwin->iova_pgsizes)) - 1;
+
+        if ((iova & pgmask) || (int128_get64(llsize) & pgmask)) {
+            trace_vfio_listener_region_add_no_dma_map(
+                memory_region_name(section->mr),
+                section->offset_within_address_space,
+                int128_getlo(section->size),
+                pgmask + 1);
+            return;
+        }
+    }
+
     ret = vfio_dma_map(container, iova, int128_get64(llsize),
                        vaddr, section->readonly);
     if (ret) {
         error_report("vfio_dma_map(%p, 0x%"HWADDR_PRIx", "
                      "0x%"HWADDR_PRIx", %p) = %d (%m)",
                      container, iova, int128_get64(llsize), vaddr, ret);
+        if (memory_region_is_ram_device(section->mr)) {
+            /* Allow unexpected mappings not to be fatal for RAM devices */
+            return;
+        }
         goto fail;
     }
 
     return;
 
 fail:
+    if (memory_region_is_ram_device(section->mr)) {
+        error_report("failed to vfio_dma_map. pci p2p may not work");
+        return;
+    }
     /*
      * On the initfn path, store the first error in the container so we
      * can gracefully fail.  Runtime, there's not much we can do other
@@ -531,6 +604,7 @@ static void vfio_listener_region_del(MemoryListener *listener,
     hwaddr iova, end;
     Int128 llend, llsize;
     int ret;
+    bool try_unmap = true;
 
     if (vfio_listener_skipped_section(section)) {
         trace_vfio_listener_region_del_skip(
@@ -550,8 +624,9 @@ static void vfio_listener_region_del(MemoryListener *listener,
         VFIOGuestIOMMU *giommu;
 
         QLIST_FOREACH(giommu, &container->giommu_list, giommu_next) {
-            if (giommu->iommu == section->mr) {
-                memory_region_unregister_iommu_notifier(giommu->iommu,
+            if (MEMORY_REGION(giommu->iommu) == section->mr &&
+                giommu->n.start == section->offset_within_region) {
+                memory_region_unregister_iommu_notifier(section->mr,
                                                         &giommu->n);
                 QLIST_REMOVE(giommu, giommu_next);
                 g_free(giommu);
@@ -582,13 +657,33 @@ static void vfio_listener_region_del(MemoryListener *listener,
 
     trace_vfio_listener_region_del(iova, end);
 
-    ret = vfio_dma_unmap(container, iova, int128_get64(llsize));
-    memory_region_unref(section->mr);
-    if (ret) {
-        error_report("vfio_dma_unmap(%p, 0x%"HWADDR_PRIx", "
-                     "0x%"HWADDR_PRIx") = %d (%m)",
-                     container, iova, int128_get64(llsize), ret);
+    if (memory_region_is_ram_device(section->mr)) {
+        hwaddr pgmask;
+        VFIOHostDMAWindow *hostwin;
+        bool hostwin_found = false;
+
+        QLIST_FOREACH(hostwin, &container->hostwin_list, hostwin_next) {
+            if (hostwin->min_iova <= iova && end <= hostwin->max_iova) {
+                hostwin_found = true;
+                break;
+            }
+        }
+        assert(hostwin_found); /* or region_add() would have failed */
+
+        pgmask = (1ULL << ctz64(hostwin->iova_pgsizes)) - 1;
+        try_unmap = !((iova & pgmask) || (int128_get64(llsize) & pgmask));
     }
+
+    if (try_unmap) {
+        ret = vfio_dma_unmap(container, iova, int128_get64(llsize));
+        if (ret) {
+            error_report("vfio_dma_unmap(%p, 0x%"HWADDR_PRIx", "
+                         "0x%"HWADDR_PRIx") = %d (%m)",
+                         container, iova, int128_get64(llsize), ret);
+        }
+    }
+
+    memory_region_unref(section->mr);
 
     if (container->iommu_type == VFIO_SPAPR_TCE_v2_IOMMU) {
         vfio_spapr_remove_window(container,
@@ -811,6 +906,13 @@ void vfio_region_finalize(VFIORegion *region)
     g_free(region->mmaps);
 
     trace_vfio_region_finalize(region->vbasedev->name, region->nr);
+
+    region->mem = NULL;
+    region->mmaps = NULL;
+    region->nr_mmaps = 0;
+    region->size = 0;
+    region->flags = 0;
+    region->nr = 0;
 }
 
 void vfio_region_mmaps_set_enabled(VFIORegion *region, bool enabled)
@@ -838,13 +940,15 @@ void vfio_reset_handler(void *opaque)
 
     QLIST_FOREACH(group, &vfio_group_list, next) {
         QLIST_FOREACH(vbasedev, &group->device_list, next) {
-            vbasedev->ops->vfio_compute_needs_reset(vbasedev);
+            if (vbasedev->dev->realized) {
+                vbasedev->ops->vfio_compute_needs_reset(vbasedev);
+            }
         }
     }
 
     QLIST_FOREACH(group, &vfio_group_list, next) {
         QLIST_FOREACH(vbasedev, &group->device_list, next) {
-            if (vbasedev->needs_reset) {
+            if (vbasedev->dev->realized && vbasedev->needs_reset) {
                 vbasedev->ops->vfio_hot_reset_multi(vbasedev);
             }
         }
@@ -941,10 +1045,38 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
 
     space = vfio_get_address_space(as);
 
+    /*
+     * VFIO is currently incompatible with memory ballooning insofar as the
+     * madvise to purge (zap) the page from QEMU's address space does not
+     * interact with the memory API and therefore leaves stale virtual to
+     * physical mappings in the IOMMU if the page was previously pinned.  We
+     * therefore add a balloon inhibit for each group added to a container,
+     * whether the container is used individually or shared.  This provides
+     * us with options to allow devices within a group to opt-in and allow
+     * ballooning, so long as it is done consistently for a group (for instance
+     * if the device is an mdev device where it is known that the host vendor
+     * driver will never pin pages outside of the working set of the guest
+     * driver, which would thus not be ballooning candidates).
+     *
+     * The first opportunity to induce pinning occurs here where we attempt to
+     * attach the group to existing containers within the AddressSpace.  If any
+     * pages are already zapped from the virtual address space, such as from a
+     * previous ballooning opt-in, new pinning will cause valid mappings to be
+     * re-established.  Likewise, when the overall MemoryListener for a new
+     * container is registered, a replay of mappings within the AddressSpace
+     * will occur, re-establishing any previously zapped pages as well.
+     *
+     * NB. Balloon inhibiting does not currently block operation of the
+     * balloon driver or revoke previously pinned pages, it only prevents
+     * calling madvise to modify the virtual mapping of ballooned pages.
+     */
+    qemu_balloon_inhibit(true);
+
     QLIST_FOREACH(container, &space->containers, next) {
         if (!ioctl(group->fd, VFIO_GROUP_SET_CONTAINER, &container->fd)) {
             group->container = container;
             QLIST_INSERT_HEAD(&container->group_list, group, container_next);
+            vfio_kvm_device_add_group(group);
             return 0;
         }
     }
@@ -967,6 +1099,8 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
     container = g_malloc0(sizeof(*container));
     container->space = space;
     container->fd = fd;
+    QLIST_INIT(&container->giommu_list);
+    QLIST_INIT(&container->hostwin_list);
     if (ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1_IOMMU) ||
         ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1v2_IOMMU)) {
         bool v2 = !!ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_TYPE1v2_IOMMU);
@@ -1002,6 +1136,7 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
             info.iova_pgsizes = 4096;
         }
         vfio_host_win_add(container, 0, (hwaddr)-1, info.iova_pgsizes);
+        container->pgsizes = info.iova_pgsizes;
     } else if (ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_SPAPR_TCE_IOMMU) ||
                ioctl(fd, VFIO_CHECK_EXTENSION, VFIO_SPAPR_TCE_v2_IOMMU)) {
         struct vfio_iommu_spapr_tce_info info;
@@ -1016,6 +1151,11 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
         container->iommu_type =
             v2 ? VFIO_SPAPR_TCE_v2_IOMMU : VFIO_SPAPR_TCE_IOMMU;
         ret = ioctl(fd, VFIO_SET_IOMMU, container->iommu_type);
+        if (ret) {
+            container->iommu_type = VFIO_SPAPR_TCE_IOMMU;
+            v2 = false;
+            ret = ioctl(fd, VFIO_SET_IOMMU, container->iommu_type);
+        }
         if (ret) {
             error_setg_errno(errp, errno, "failed to set iommu for container");
             ret = -errno;
@@ -1061,6 +1201,7 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
         }
 
         if (v2) {
+            container->pgsizes = info.ddw.pgsizes;
             /*
              * There is a default window in just created container.
              * To make region_add/del simpler, we better remove this
@@ -1075,6 +1216,7 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
             }
         } else {
             /* The default table uses 4K pages */
+            container->pgsizes = 0x1000;
             vfio_host_win_add(container, info.dma32_window_start,
                               info.dma32_window_start +
                               info.dma32_window_size - 1,
@@ -1085,6 +1227,14 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
         ret = -EINVAL;
         goto free_container_exit;
     }
+
+    vfio_kvm_device_add_group(group);
+
+    QLIST_INIT(&container->group_list);
+    QLIST_INSERT_HEAD(&space->containers, container, next);
+
+    group->container = container;
+    QLIST_INSERT_HEAD(&container->group_list, group, container_next);
 
     container->listener = vfio_memory_listener;
 
@@ -1099,14 +1249,11 @@ static int vfio_connect_container(VFIOGroup *group, AddressSpace *as,
 
     container->initialized = true;
 
-    QLIST_INIT(&container->group_list);
-    QLIST_INSERT_HEAD(&space->containers, container, next);
-
-    group->container = container;
-    QLIST_INSERT_HEAD(&container->group_list, group, container_next);
-
     return 0;
 listener_release_exit:
+    QLIST_REMOVE(group, container_next);
+    QLIST_REMOVE(container, next);
+    vfio_kvm_device_del_group(group);
     vfio_listener_release(container);
 
 free_container_exit:
@@ -1116,6 +1263,7 @@ close_fd_exit:
     close(fd);
 
 put_space_exit:
+    qemu_balloon_inhibit(false);
     vfio_put_address_space(space);
 
     return ret;
@@ -1125,23 +1273,32 @@ static void vfio_disconnect_container(VFIOGroup *group)
 {
     VFIOContainer *container = group->container;
 
+    QLIST_REMOVE(group, container_next);
+    group->container = NULL;
+
+    /*
+     * Explicitly release the listener first before unset container,
+     * since unset may destroy the backend container if it's the last
+     * group.
+     */
+    if (QLIST_EMPTY(&container->group_list)) {
+        vfio_listener_release(container);
+    }
+
     if (ioctl(group->fd, VFIO_GROUP_UNSET_CONTAINER, &container->fd)) {
         error_report("vfio: error disconnecting group %d from container",
                      group->groupid);
     }
 
-    QLIST_REMOVE(group, container_next);
-    group->container = NULL;
-
     if (QLIST_EMPTY(&container->group_list)) {
         VFIOAddressSpace *space = container->space;
         VFIOGuestIOMMU *giommu, *tmp;
 
-        vfio_listener_release(container);
         QLIST_REMOVE(container, next);
 
         QLIST_FOREACH_SAFE(giommu, &container->giommu_list, giommu_next, tmp) {
-            memory_region_unregister_iommu_notifier(giommu->iommu, &giommu->n);
+            memory_region_unregister_iommu_notifier(
+                    MEMORY_REGION(giommu->iommu), &giommu->n);
             QLIST_REMOVE(giommu, giommu_next);
             g_free(giommu);
         }
@@ -1210,8 +1367,6 @@ VFIOGroup *vfio_get_group(int groupid, AddressSpace *as, Error **errp)
 
     QLIST_INSERT_HEAD(&vfio_group_list, group, next);
 
-    vfio_kvm_device_add_group(group);
-
     return group;
 
 close_fd_exit:
@@ -1229,6 +1384,9 @@ void vfio_put_group(VFIOGroup *group)
         return;
     }
 
+    if (!group->balloon_allowed) {
+        qemu_balloon_inhibit(false);
+    }
     vfio_kvm_device_del_group(group);
     vfio_disconnect_container(group);
     QLIST_REMOVE(group, next);
@@ -1262,6 +1420,26 @@ int vfio_get_device(VFIOGroup *group, const char *name,
         error_setg_errno(errp, errno, "error getting device info");
         close(fd);
         return ret;
+    }
+
+    /*
+     * Clear the balloon inhibitor for this group if the driver knows the
+     * device operates compatibly with ballooning.  Setting must be consistent
+     * per group, but since compatibility is really only possible with mdev
+     * currently, we expect singleton groups.
+     */
+    if (vbasedev->balloon_allowed != group->balloon_allowed) {
+        if (!QLIST_EMPTY(&group->device_list)) {
+            error_setg(errp,
+                       "Inconsistent device balloon setting within group");
+            close(fd);
+            return -1;
+        }
+
+        if (!group->balloon_allowed) {
+            group->balloon_allowed = true;
+            qemu_balloon_inhibit(false);
+        }
     }
 
     vbasedev->fd = fd;
@@ -1350,6 +1528,21 @@ int vfio_get_dev_region_info(VFIODevice *vbasedev, uint32_t type,
 
     *info = NULL;
     return -ENODEV;
+}
+
+bool vfio_has_region_cap(VFIODevice *vbasedev, int region, uint16_t cap_type)
+{
+    struct vfio_region_info *info = NULL;
+    bool ret = false;
+
+    if (!vfio_get_region_info(vbasedev, region, &info)) {
+        if (vfio_get_region_info_cap(info, cap_type)) {
+            ret = true;
+        }
+        g_free(info);
+    }
+
+    return ret;
 }
 
 /*

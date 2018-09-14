@@ -26,11 +26,8 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "exec/address-spaces.h"
-#include "exec/exec-all.h"
-#include "exec/ioport.h"
 
 #include "qemu-common.h"
-#include "strings.h"
 #include "hax-i386.h"
 #include "sysemu/accel.h"
 #include "sysemu/sysemu.h"
@@ -103,6 +100,8 @@ static int hax_get_capability(struct hax_state *hax)
         fprintf(stderr, "UG mode is not supported by the hardware.\n");
         return -ENOTSUP;
     }
+
+    hax->supports_64bit_ramblock = !!(cap->winfo & HAX_CAP_64BIT_RAMBLOCK);
 
     if (cap->wstatus & HAX_CAP_MEMQUOTA) {
         if (cap->mem_quota < hax->mem_quota) {
@@ -232,7 +231,7 @@ int hax_init_vcpu(CPUState *cpu)
     }
 
     cpu->hax_vcpu = hax_global.vm->vcpus[cpu->cpu_index];
-    cpu->hax_vcpu_dirty = true;
+    cpu->vcpu_dirty = true;
     qemu_register_reset(hax_reset_vcpu_state, (CPUArchState *) (cpu->env_ptr));
 
     return ret;
@@ -514,9 +513,10 @@ static int hax_vcpu_hax_exec(CPUArchState *env)
         hax_vcpu_interrupt(env);
 
         qemu_mutex_unlock_iothread();
+        cpu_exec_start(cpu);
         hax_ret = hax_vcpu_run(vcpu);
+        cpu_exec_end(cpu);
         qemu_mutex_lock_iothread();
-        current_cpu = cpu;
 
         /* Simply continue the vcpu_run if system call interrupted */
         if (hax_ret == -EINTR || hax_ret == -EAGAIN) {
@@ -540,14 +540,14 @@ static int hax_vcpu_hax_exec(CPUArchState *env)
         /* Guest state changed, currently only for shutdown */
         case HAX_EXIT_STATECHANGE:
             fprintf(stdout, "VCPU shutdown request\n");
-            qemu_system_shutdown_request();
+            qemu_system_shutdown_request(SHUTDOWN_CAUSE_GUEST_SHUTDOWN);
             hax_vcpu_sync_state(env, 0);
             ret = 1;
             break;
         case HAX_EXIT_UNKNOWN_VMEXIT:
             fprintf(stderr, "Unknown VMX exit %x from guest\n",
                     ht->_exit_reason);
-            qemu_system_reset_request();
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             hax_vcpu_sync_state(env, 0);
             cpu_dump_state(cpu, stderr, fprintf, 0);
             ret = -1;
@@ -578,7 +578,7 @@ static int hax_vcpu_hax_exec(CPUArchState *env)
             break;
         default:
             fprintf(stderr, "Unknown exit %x from HAX\n", ht->_exit_status);
-            qemu_system_reset_request();
+            qemu_system_reset_request(SHUTDOWN_CAUSE_GUEST_RESET);
             hax_vcpu_sync_state(env, 0);
             cpu_dump_state(cpu, stderr, fprintf, 0);
             ret = 1;
@@ -598,12 +598,12 @@ static void do_hax_cpu_synchronize_state(CPUState *cpu, run_on_cpu_data arg)
     CPUArchState *env = cpu->env_ptr;
 
     hax_arch_get_registers(env);
-    cpu->hax_vcpu_dirty = true;
+    cpu->vcpu_dirty = true;
 }
 
 void hax_cpu_synchronize_state(CPUState *cpu)
 {
-    if (!cpu->hax_vcpu_dirty) {
+    if (!cpu->vcpu_dirty) {
         run_on_cpu(cpu, do_hax_cpu_synchronize_state, RUN_ON_CPU_NULL);
     }
 }
@@ -614,7 +614,7 @@ static void do_hax_cpu_synchronize_post_reset(CPUState *cpu,
     CPUArchState *env = cpu->env_ptr;
 
     hax_vcpu_sync_state(env, 1);
-    cpu->hax_vcpu_dirty = false;
+    cpu->vcpu_dirty = false;
 }
 
 void hax_cpu_synchronize_post_reset(CPUState *cpu)
@@ -627,12 +627,22 @@ static void do_hax_cpu_synchronize_post_init(CPUState *cpu, run_on_cpu_data arg)
     CPUArchState *env = cpu->env_ptr;
 
     hax_vcpu_sync_state(env, 1);
-    cpu->hax_vcpu_dirty = false;
+    cpu->vcpu_dirty = false;
 }
 
 void hax_cpu_synchronize_post_init(CPUState *cpu)
 {
     run_on_cpu(cpu, do_hax_cpu_synchronize_post_init, RUN_ON_CPU_NULL);
+}
+
+static void do_hax_cpu_synchronize_pre_loadvm(CPUState *cpu, run_on_cpu_data arg)
+{
+    cpu->vcpu_dirty = true;
+}
+
+void hax_cpu_synchronize_pre_loadvm(CPUState *cpu)
+{
+    run_on_cpu(cpu, do_hax_cpu_synchronize_pre_loadvm, RUN_ON_CPU_NULL);
 }
 
 int hax_smp_cpu_exec(CPUState *cpu)
@@ -771,56 +781,6 @@ static int hax_set_segments(CPUArchState *env, struct vcpu_state_t *sregs)
     return 0;
 }
 
-/*
- * After get the state from the kernel module, some
- * qemu emulator state need be updated also
- */
-static int hax_setup_qemu_emulator(CPUArchState *env)
-{
-
-#define HFLAG_COPY_MASK (~( \
-  HF_CPL_MASK | HF_PE_MASK | HF_MP_MASK | HF_EM_MASK | \
-  HF_TS_MASK | HF_TF_MASK | HF_VM_MASK | HF_IOPL_MASK | \
-  HF_OSFXSR_MASK | HF_LMA_MASK | HF_CS32_MASK | \
-  HF_SS32_MASK | HF_CS64_MASK | HF_ADDSEG_MASK))
-
-    uint32_t hflags;
-
-    hflags = (env->segs[R_CS].flags >> DESC_DPL_SHIFT) & HF_CPL_MASK;
-    hflags |= (env->cr[0] & CR0_PE_MASK) << (HF_PE_SHIFT - CR0_PE_SHIFT);
-    hflags |= (env->cr[0] << (HF_MP_SHIFT - CR0_MP_SHIFT)) &
-        (HF_MP_MASK | HF_EM_MASK | HF_TS_MASK);
-    hflags |= (env->eflags & (HF_TF_MASK | HF_VM_MASK | HF_IOPL_MASK));
-    hflags |= (env->cr[4] & CR4_OSFXSR_MASK) <<
-              (HF_OSFXSR_SHIFT - CR4_OSFXSR_SHIFT);
-
-    if (env->efer & MSR_EFER_LMA) {
-        hflags |= HF_LMA_MASK;
-    }
-
-    if ((hflags & HF_LMA_MASK) && (env->segs[R_CS].flags & DESC_L_MASK)) {
-        hflags |= HF_CS32_MASK | HF_SS32_MASK | HF_CS64_MASK;
-    } else {
-        hflags |= (env->segs[R_CS].flags & DESC_B_MASK) >>
-            (DESC_B_SHIFT - HF_CS32_SHIFT);
-        hflags |= (env->segs[R_SS].flags & DESC_B_MASK) >>
-            (DESC_B_SHIFT - HF_SS32_SHIFT);
-        if (!(env->cr[0] & CR0_PE_MASK) ||
-            (env->eflags & VM_MASK) || !(hflags & HF_CS32_MASK)) {
-            hflags |= HF_ADDSEG_MASK;
-        } else {
-            hflags |= ((env->segs[R_DS].base |
-                        env->segs[R_ES].base |
-                        env->segs[R_SS].base) != 0) << HF_ADDSEG_SHIFT;
-        }
-    }
-
-    hflags &= ~HF_SMM_MASK;
-
-    env->hflags = (env->hflags & HFLAG_COPY_MASK) | hflags;
-    return 0;
-}
-
 static int hax_sync_vcpu_register(CPUArchState *env, int set)
 {
     struct vcpu_state_t regs;
@@ -875,9 +835,6 @@ static int hax_sync_vcpu_register(CPUArchState *env, int set)
         if (ret < 0) {
             return -1;
         }
-    }
-    if (!set) {
-        hax_setup_qemu_emulator(env);
     }
     return 0;
 }
@@ -1059,6 +1016,7 @@ static int hax_arch_get_registers(CPUArchState *env)
         return ret;
     }
 
+    x86_update_hflags(env);
     return 0;
 }
 

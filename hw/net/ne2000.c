@@ -22,12 +22,11 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
-#include "hw/hw.h"
 #include "hw/pci/pci.h"
-#include "net/net.h"
+#include "net/eth.h"
 #include "ne2000.h"
-#include "hw/loader.h"
 #include "sysemu/sysemu.h"
+#include "trace.h"
 
 /* debug NE2000 card */
 //#define DEBUG_NE2000
@@ -201,7 +200,7 @@ ssize_t ne2000_receive(NetClientState *nc, const uint8_t *buf, size_t size_)
             /* multicast */
             if (!(s->rxcr & 0x08))
                 return size;
-            mcast_idx = compute_mcast_idx(buf);
+            mcast_idx = net_crc32(buf, ETH_ALEN) >> 26;
             if (!(s->mult[mcast_idx >> 3] & (1 << (mcast_idx & 7))))
                 return size;
         } else if (s->mem[0] == buf[0] &&
@@ -278,9 +277,7 @@ static void ne2000_ioport_write(void *opaque, uint32_t addr, uint32_t val)
     int offset, page, index;
 
     addr &= 0xf;
-#ifdef DEBUG_NE2000
-    printf("NE2000: write addr=0x%x val=0x%02x\n", addr, val);
-#endif
+    trace_ne2000_ioport_write(addr, val);
     if (addr == E8390_CMD) {
         /* control register */
         s->cmd = val;
@@ -443,9 +440,7 @@ static uint32_t ne2000_ioport_read(void *opaque, uint32_t addr)
             break;
         }
     }
-#ifdef DEBUG_NE2000
-    printf("NE2000: read addr=0x%x val=%02x\n", addr, ret);
-#endif
+    trace_ne2000_ioport_read(addr, ret);
     return ret;
 }
 
@@ -664,19 +659,24 @@ static uint64_t ne2000_read(void *opaque, hwaddr addr,
                             unsigned size)
 {
     NE2000State *s = opaque;
+    uint64_t val;
 
     if (addr < 0x10 && size == 1) {
-        return ne2000_ioport_read(s, addr);
+        val = ne2000_ioport_read(s, addr);
     } else if (addr == 0x10) {
         if (size <= 2) {
-            return ne2000_asic_ioport_read(s, addr);
+            val = ne2000_asic_ioport_read(s, addr);
         } else {
-            return ne2000_asic_ioport_readl(s, addr);
+            val = ne2000_asic_ioport_readl(s, addr);
         }
     } else if (addr == 0x1f && size == 1) {
-        return ne2000_reset_ioport_read(s, addr);
+        val = ne2000_reset_ioport_read(s, addr);
+    } else {
+        val = ((uint64_t)1 << (size * 8)) - 1;
     }
-    return ((uint64_t)1 << (size * 8)) - 1;
+    trace_ne2000_read(addr, val);
+
+    return val;
 }
 
 static void ne2000_write(void *opaque, hwaddr addr,
@@ -684,6 +684,7 @@ static void ne2000_write(void *opaque, hwaddr addr,
 {
     NE2000State *s = opaque;
 
+    trace_ne2000_write(addr, data);
     if (addr < 0x10 && size == 1) {
         ne2000_ioport_write(s, addr, data);
     } else if (addr == 0x10) {
@@ -786,6 +787,10 @@ static const TypeInfo ne2000_info = {
     .instance_size = sizeof(PCINE2000State),
     .class_init    = ne2000_class_init,
     .instance_init = ne2000_instance_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void ne2000_register_types(void)

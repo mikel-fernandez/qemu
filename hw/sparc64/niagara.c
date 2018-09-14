@@ -23,7 +23,7 @@
  */
 
 #include "qemu/osdep.h"
-#include "qapi/error.h"
+#include "qemu/units.h"
 #include "qemu-common.h"
 #include "cpu.h"
 #include "hw/hw.h"
@@ -85,7 +85,7 @@ typedef struct NiagaraBoardState {
 #define NIAGARA_PROM_BASE   0xfff0000000ULL
 #define NIAGARA_Q_OFFSET    0x10000ULL
 #define NIAGARA_OBP_OFFSET  0x80000ULL
-#define PROM_SIZE_MAX       (4 * 1024 * 1024)
+#define PROM_SIZE_MAX       (4 * MiB)
 
 static void add_rom_or_fail(const char *file, const hwaddr addr)
 {
@@ -106,8 +106,7 @@ static void niagara_init(MachineState *machine)
     MemoryRegion *sysmem = get_system_memory();
 
     /* init CPUs */
-    sparc64_cpu_devinit(machine->cpu_model, "Sun UltraSparc T1",
-                        NIAGARA_PROM_BASE);
+    sparc64_cpu_devinit(machine->cpu_type, NIAGARA_PROM_BASE);
     /* set up devices */
     memory_region_allocate_system_memory(&s->hv_ram, NULL, "sun4v-hv.ram",
                                          NIAGARA_HV_RAM_SIZE);
@@ -153,14 +152,14 @@ static void niagara_init(MachineState *machine)
             dinfo->is_default = 1;
             rom_add_file_fixed(blk_bs(blk)->filename, NIAGARA_VDISK_BASE, -1);
         } else {
-            fprintf(stderr, "qemu: could not load ram disk '%s'\n",
-                    blk_bs(blk)->filename);
+            error_report("could not load ram disk '%s'",
+                         blk_bs(blk)->filename);
             exit(1);
         }
     }
-    if (serial_hds[0]) {
+    if (serial_hd(0)) {
         serial_mm_init(sysmem, NIAGARA_UART_BASE, 0, NULL, 115200,
-                       serial_hds[0], DEVICE_BIG_ENDIAN);
+                       serial_hd(0), DEVICE_BIG_ENDIAN);
     }
     empty_slot_init(NIAGARA_IOBBASE, NIAGARA_IOBSIZE);
     sun4v_rtc_init(NIAGARA_RTC_BASE);
@@ -174,6 +173,7 @@ static void niagara_class_init(ObjectClass *oc, void *data)
     mc->init = niagara_init;
     mc->max_cpus = 1; /* XXX for now */
     mc->default_boot_order = "c";
+    mc->default_cpu_type = SPARC_CPU_TYPE_NAME("Sun-UltraSparc-T1");
 }
 
 static const TypeInfo niagara_type = {

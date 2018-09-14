@@ -21,6 +21,7 @@
 #include "qemu/osdep.h"
 #include "qapi/error.h"
 #include "crypto/hash.h"
+#include "hashpriv.h"
 
 
 static int qcrypto_hash_alg_map[QCRYPTO_HASH_ALG__MAX] = {
@@ -29,11 +30,7 @@ static int qcrypto_hash_alg_map[QCRYPTO_HASH_ALG__MAX] = {
     [QCRYPTO_HASH_ALG_SHA224] = -1,
     [QCRYPTO_HASH_ALG_SHA256] = G_CHECKSUM_SHA256,
     [QCRYPTO_HASH_ALG_SHA384] = -1,
-#if GLIB_CHECK_VERSION(2, 36, 0)
     [QCRYPTO_HASH_ALG_SHA512] = G_CHECKSUM_SHA512,
-#else
-    [QCRYPTO_HASH_ALG_SHA512] = -1,
-#endif
     [QCRYPTO_HASH_ALG_RIPEMD160] = -1,
 };
 
@@ -47,12 +44,13 @@ gboolean qcrypto_hash_supports(QCryptoHashAlgorithm alg)
 }
 
 
-int qcrypto_hash_bytesv(QCryptoHashAlgorithm alg,
-                        const struct iovec *iov,
-                        size_t niov,
-                        uint8_t **result,
-                        size_t *resultlen,
-                        Error **errp)
+static int
+qcrypto_glib_hash_bytesv(QCryptoHashAlgorithm alg,
+                         const struct iovec *iov,
+                         size_t niov,
+                         uint8_t **result,
+                         size_t *resultlen,
+                         Error **errp)
 {
     int i, ret;
     GChecksum *cs;
@@ -95,3 +93,8 @@ int qcrypto_hash_bytesv(QCryptoHashAlgorithm alg,
     g_checksum_free(cs);
     return -1;
 }
+
+
+QCryptoHashDriver qcrypto_hash_lib_driver = {
+    .hash_bytesv = qcrypto_glib_hash_bytesv,
+};

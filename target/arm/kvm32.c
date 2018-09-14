@@ -28,7 +28,7 @@ static inline void set_feature(uint64_t *features, int feature)
     *features |= 1ULL << feature;
 }
 
-bool kvm_arm_get_host_cpu_features(ARMHostCPUClass *ahcc)
+bool kvm_arm_get_host_cpu_features(ARMHostCPUFeatures *ahcf)
 {
     /* Identify the feature bits corresponding to the host CPU, and
      * fill out the ARMHostCPUClass fields accordingly. To do this
@@ -36,7 +36,7 @@ bool kvm_arm_get_host_cpu_features(ARMHostCPUClass *ahcc)
      * and then query that CPU for the relevant ID registers.
      */
     int i, ret, fdarray[3];
-    uint32_t midr, id_pfr0, id_isar0, mvfr1;
+    uint32_t midr, id_pfr0, mvfr1;
     uint64_t features = 0;
     /* Old kernels may not know about the PREFERRED_TARGET ioctl: however
      * we know these will only support creating one kind of guest CPU,
@@ -60,11 +60,6 @@ bool kvm_arm_get_host_cpu_features(ARMHostCPUClass *ahcc)
         },
         {
             .id = KVM_REG_ARM | KVM_REG_SIZE_U32
-            | ENCODE_CP_REG(15, 0, 0, 0, 2, 0, 0),
-            .addr = (uintptr_t)&id_isar0,
-        },
-        {
-            .id = KVM_REG_ARM | KVM_REG_SIZE_U32
             | KVM_REG_ARM_VFP | KVM_REG_ARM_VFP_MVFR1,
             .addr = (uintptr_t)&mvfr1,
         },
@@ -74,13 +69,13 @@ bool kvm_arm_get_host_cpu_features(ARMHostCPUClass *ahcc)
         return false;
     }
 
-    ahcc->target = init.target;
+    ahcf->target = init.target;
 
     /* This is not strictly blessed by the device tree binding docs yet,
      * but in practice the kernel does not care about this string so
      * there is no point maintaining an KVM_ARM_TARGET_* -> string table.
      */
-    ahcc->dtb_compatible = "arm,arm-v7";
+    ahcf->dtb_compatible = "arm,arm-v7";
 
     for (i = 0; i < ARRAY_SIZE(idregs); i++) {
         ret = ioctl(fdarray[2], KVM_GET_ONE_REG, &idregs[i]);
@@ -98,25 +93,13 @@ bool kvm_arm_get_host_cpu_features(ARMHostCPUClass *ahcc)
     /* Now we've retrieved all the register information we can
      * set the feature bits based on the ID register fields.
      * We can assume any KVM supporting CPU is at least a v7
-     * with VFPv3, LPAE and the generic timers; this in turn implies
-     * most of the other feature bits, but a few must be tested.
+     * with VFPv3, virtualization extensions, and the generic
+     * timers; this in turn implies most of the other feature
+     * bits, but a few must be tested.
      */
-    set_feature(&features, ARM_FEATURE_V7);
+    set_feature(&features, ARM_FEATURE_V7VE);
     set_feature(&features, ARM_FEATURE_VFP3);
-    set_feature(&features, ARM_FEATURE_LPAE);
     set_feature(&features, ARM_FEATURE_GENERIC_TIMER);
-
-    switch (extract32(id_isar0, 24, 4)) {
-    case 1:
-        set_feature(&features, ARM_FEATURE_THUMB_DIV);
-        break;
-    case 2:
-        set_feature(&features, ARM_FEATURE_ARM_DIV);
-        set_feature(&features, ARM_FEATURE_THUMB_DIV);
-        break;
-    default:
-        break;
-    }
 
     if (extract32(id_pfr0, 12, 4) == 1) {
         set_feature(&features, ARM_FEATURE_THUMB2EE);
@@ -132,7 +115,7 @@ bool kvm_arm_get_host_cpu_features(ARMHostCPUClass *ahcc)
         set_feature(&features, ARM_FEATURE_VFP4);
     }
 
-    ahcc->features = features;
+    ahcf->features = features;
 
     return true;
 }
@@ -358,7 +341,7 @@ int kvm_arch_put_registers(CPUState *cs, int level)
     /* VFP registers */
     r.id = KVM_REG_ARM | KVM_REG_SIZE_U64 | KVM_REG_ARM_VFP;
     for (i = 0; i < 32; i++) {
-        r.addr = (uintptr_t)(&env->vfp.regs[i]);
+        r.addr = (uintptr_t)aa32_vfp_dreg(env, i);
         ret = kvm_vcpu_ioctl(cs, KVM_SET_ONE_REG, &r);
         if (ret) {
             return ret;
@@ -445,7 +428,7 @@ int kvm_arch_get_registers(CPUState *cs)
     /* VFP registers */
     r.id = KVM_REG_ARM | KVM_REG_SIZE_U64 | KVM_REG_ARM_VFP;
     for (i = 0; i < 32; i++) {
-        r.addr = (uintptr_t)(&env->vfp.regs[i]);
+        r.addr = (uintptr_t)aa32_vfp_dreg(env, i);
         ret = kvm_vcpu_ioctl(cs, KVM_GET_ONE_REG, &r);
         if (ret) {
             return ret;
@@ -522,8 +505,12 @@ bool kvm_arm_hw_debug_active(CPUState *cs)
     return false;
 }
 
-int kvm_arm_pmu_create(CPUState *cs, int irq)
+void kvm_arm_pmu_set_irq(CPUState *cs, int irq)
 {
     qemu_log_mask(LOG_UNIMP, "%s: not implemented\n", __func__);
-    return 0;
+}
+
+void kvm_arm_pmu_init(CPUState *cs)
+{
+    qemu_log_mask(LOG_UNIMP, "%s: not implemented\n", __func__);
 }

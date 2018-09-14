@@ -1,4 +1,4 @@
-# See docs/tracing.txt for syntax documentation.
+# See docs/devel/tracing.txt for syntax documentation.
 
 # crypto/tlscreds.c
 qcrypto_tls_creds_load_dh(void *creds, const char *filename) "TLS creds load DH creds=%p filename=%s"
@@ -6,6 +6,9 @@ qcrypto_tls_creds_get_path(void *creds, const char *filename, const char *path) 
 
 # crypto/tlscredsanon.c
 qcrypto_tls_creds_anon_load(void *creds, const char *dir) "TLS creds anon load creds=%p dir=%s"
+
+# crypto/tlscredspsk.c
+qcrypto_tls_creds_psk_load(void *creds, const char *dir) "TLS creds psk load creds=%p dir=%s"
 
 # crypto/tlscredsx509.c
 qcrypto_tls_creds_x509_load(void *creds, const char *dir) "TLS creds x509 load creds=%p dir=%s"

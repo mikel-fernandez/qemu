@@ -19,6 +19,8 @@
 #ifndef _PPC_PNV_LPC_H
 #define _PPC_PNV_LPC_H
 
+#include "hw/ppc/pnv_psi.h"
+
 #define TYPE_PNV_LPC "pnv-lpc"
 #define PNV_LPC(obj) \
      OBJECT_CHECK(PnvLpcController, (obj), TYPE_PNV_LPC)
@@ -36,6 +38,7 @@ typedef struct PnvLpcController {
     /* ISA IO and Memory space */
     MemoryRegion isa_io;
     MemoryRegion isa_mem;
+    MemoryRegion isa_fw;
 
     /* Windows from OPB to ISA (aliases) */
     MemoryRegion opb_isa_io;
@@ -62,6 +65,11 @@ typedef struct PnvLpcController {
 
     /* XSCOM registers */
     MemoryRegion xscom_regs;
+
+    /* PSI to generate interrupts */
+    PnvPsi *psi;
 } PnvLpcController;
+
+ISABus *pnv_lpc_isa_create(PnvLpcController *lpc, bool use_cpld, Error **errp);
 
 #endif /* _PPC_PNV_LPC_H */

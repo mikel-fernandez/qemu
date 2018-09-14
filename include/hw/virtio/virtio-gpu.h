@@ -18,10 +18,10 @@
 #include "ui/qemu-pixman.h"
 #include "ui/console.h"
 #include "hw/virtio/virtio.h"
-#include "hw/pci/pci.h"
 #include "qemu/log.h"
 
 #include "standard-headers/linux/virtio_gpu.h"
+
 #define TYPE_VIRTIO_GPU "virtio-gpu-device"
 #define VIRTIO_GPU(obj)                                        \
         OBJECT_CHECK(VirtIOGPU, (obj), TYPE_VIRTIO_GPU)
@@ -72,6 +72,8 @@ struct virtio_gpu_conf {
     uint64_t max_hostmem;
     uint32_t max_outputs;
     uint32_t flags;
+    uint32_t xres;
+    uint32_t yres;
 };
 
 struct virtio_gpu_ctrl_command {
@@ -123,6 +125,7 @@ typedef struct VirtIOGPU {
         uint32_t bytes_3d;
     } stats;
 
+    void (*disable_scanout)(struct VirtIOGPU *g, int scanout_id);
     Error *migration_blocker;
 } VirtIOGPU;
 
@@ -167,6 +170,7 @@ void virtio_gpu_virgl_process_cmd(VirtIOGPU *g,
                                   struct virtio_gpu_ctrl_command *cmd);
 void virtio_gpu_virgl_fence_poll(VirtIOGPU *g);
 void virtio_gpu_virgl_reset(VirtIOGPU *g);
+void virtio_gpu_gl_block(void *opaque, bool block);
 int virtio_gpu_virgl_init(VirtIOGPU *g);
-
+int virtio_gpu_virgl_get_num_capsets(VirtIOGPU *g);
 #endif

@@ -381,6 +381,9 @@ GSource *aio_get_g_source(AioContext *ctx);
 /* Return the ThreadPool bound to this AioContext */
 struct ThreadPool *aio_get_thread_pool(AioContext *ctx);
 
+/* Setup the LinuxAioState bound to this AioContext */
+struct LinuxAioState *aio_setup_linux_aio(AioContext *ctx, Error **errp);
+
 /* Return the LinuxAioState bound to this AioContext */
 struct LinuxAioState *aio_get_linux_aio(AioContext *ctx);
 
@@ -454,8 +457,14 @@ static inline void aio_disable_external(AioContext *ctx)
  */
 static inline void aio_enable_external(AioContext *ctx)
 {
-    assert(ctx->external_disable_cnt > 0);
-    atomic_dec(&ctx->external_disable_cnt);
+    int old;
+
+    old = atomic_fetch_dec(&ctx->external_disable_cnt);
+    assert(old > 0);
+    if (old == 1) {
+        /* Kick event loop so it re-arms file descriptors */
+        aio_notify(ctx);
+    }
 }
 
 /**
@@ -511,6 +520,15 @@ void aio_co_schedule(AioContext *ctx, struct Coroutine *co);
 void aio_co_wake(struct Coroutine *co);
 
 /**
+ * aio_co_enter:
+ * @ctx: the context to run the coroutine
+ * @co: the coroutine to run
+ *
+ * Enter a coroutine in the specified AioContext.
+ */
+void aio_co_enter(AioContext *ctx, struct Coroutine *co);
+
+/**
  * Return the AioContext whose event loop runs in the current thread.
  *
  * If called from an IOThread this will be the IOThread's AioContext.  If
@@ -519,11 +537,14 @@ void aio_co_wake(struct Coroutine *co);
 AioContext *qemu_get_current_aio_context(void);
 
 /**
+ * in_aio_context_home_thread:
  * @ctx: the aio context
  *
- * Return whether we are running in the I/O thread that manages @ctx.
+ * Return whether we are running in the thread that normally runs @ctx.  Note
+ * that acquiring/releasing ctx does not affect the outcome, each AioContext
+ * still only has one home thread that is responsible for running it.
  */
-static inline bool aio_context_in_iothread(AioContext *ctx)
+static inline bool in_aio_context_home_thread(AioContext *ctx)
 {
     return ctx == qemu_get_current_aio_context();
 }
@@ -535,6 +556,14 @@ static inline bool aio_context_in_iothread(AioContext *ctx)
  * Initialize the aio context.
  */
 void aio_context_setup(AioContext *ctx);
+
+/**
+ * aio_context_destroy:
+ * @ctx: the aio context
+ *
+ * Destroy the aio context.
+ */
+void aio_context_destroy(AioContext *ctx);
 
 /**
  * aio_context_set_poll_params:

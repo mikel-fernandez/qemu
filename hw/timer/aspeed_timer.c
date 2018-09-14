@@ -10,8 +10,10 @@
  */
 
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "hw/sysbus.h"
 #include "hw/timer/aspeed_timer.h"
+#include "hw/misc/aspeed_scu.h"
 #include "qemu-common.h"
 #include "qemu/bitops.h"
 #include "qemu/timer.h"
@@ -26,7 +28,6 @@
 #define TIMER_CLOCK_USE_EXT true
 #define TIMER_CLOCK_EXT_HZ 1000000
 #define TIMER_CLOCK_USE_APB false
-#define TIMER_CLOCK_APB_HZ 24000000
 
 #define TIMER_REG_STATUS 0
 #define TIMER_REG_RELOAD 1
@@ -80,11 +81,11 @@ static inline bool timer_external_clock(AspeedTimer *t)
     return timer_ctrl_status(t, op_external_clock);
 }
 
-static uint32_t clock_rates[] = { TIMER_CLOCK_APB_HZ, TIMER_CLOCK_EXT_HZ };
-
 static inline uint32_t calculate_rate(struct AspeedTimer *t)
 {
-    return clock_rates[timer_external_clock(t)];
+    AspeedTimerCtrlState *s = timer_to_ctrl(t);
+
+    return timer_external_clock(t) ? TIMER_CLOCK_EXT_HZ : s->scu->apb_freq;
 }
 
 static inline uint32_t calculate_ticks(struct AspeedTimer *t, uint64_t now_ns)
@@ -130,13 +131,24 @@ static uint64_t calculate_next(struct AspeedTimer *t)
             next = seq[1];
         } else if (now < seq[2]) {
             next = seq[2];
-        } else {
+        } else if (t->reload) {
             reload_ns = muldiv64(t->reload, NANOSECONDS_PER_SECOND, rate);
             t->start = now - ((now - t->start) % reload_ns);
+        } else {
+            /* no reload value, return 0 */
+            break;
         }
     }
 
     return next;
+}
+
+static void aspeed_timer_mod(AspeedTimer *t)
+{
+    uint64_t next = calculate_next(t);
+    if (next) {
+        timer_mod(&t->timer, next);
+    }
 }
 
 static void aspeed_timer_expire(void *opaque)
@@ -164,7 +176,7 @@ static void aspeed_timer_expire(void *opaque)
         qemu_set_irq(t->irq, t->level);
     }
 
-    timer_mod(&t->timer, calculate_next(t));
+    aspeed_timer_mod(t);
 }
 
 static uint64_t aspeed_timer_get_value(AspeedTimer *t, int reg)
@@ -227,10 +239,23 @@ static void aspeed_timer_set_value(AspeedTimerCtrlState *s, int timer, int reg,
                                    uint32_t value)
 {
     AspeedTimer *t;
+    uint32_t old_reload;
 
     trace_aspeed_timer_set_value(timer, reg, value);
     t = &s->timers[timer];
     switch (reg) {
+    case TIMER_REG_RELOAD:
+        old_reload = t->reload;
+        t->reload = value;
+
+        /* If the reload value was not previously set, or zero, and
+         * the current value is valid, try to start the timer if it is
+         * enabled.
+         */
+        if (old_reload || !t->reload) {
+            break;
+        }
+
     case TIMER_REG_STATUS:
         if (timer_enabled(t)) {
             uint64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
@@ -238,17 +263,14 @@ static void aspeed_timer_set_value(AspeedTimerCtrlState *s, int timer, int reg,
             uint32_t rate = calculate_rate(t);
 
             t->start += muldiv64(delta, NANOSECONDS_PER_SECOND, rate);
-            timer_mod(&t->timer, calculate_next(t));
+            aspeed_timer_mod(t);
         }
-        break;
-    case TIMER_REG_RELOAD:
-        t->reload = value;
         break;
     case TIMER_REG_MATCH_FIRST:
     case TIMER_REG_MATCH_SECOND:
         t->match[reg - 2] = value;
         if (timer_enabled(t)) {
-            timer_mod(&t->timer, calculate_next(t));
+            aspeed_timer_mod(t);
         }
         break;
     default:
@@ -268,7 +290,7 @@ static void aspeed_timer_ctrl_enable(AspeedTimer *t, bool enable)
     trace_aspeed_timer_ctrl_enable(t->id, enable);
     if (enable) {
         t->start = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
-        timer_mod(&t->timer, calculate_next(t));
+        aspeed_timer_mod(t);
     } else {
         timer_del(&t->timer);
     }
@@ -428,6 +450,16 @@ static void aspeed_timer_realize(DeviceState *dev, Error **errp)
     int i;
     SysBusDevice *sbd = SYS_BUS_DEVICE(dev);
     AspeedTimerCtrlState *s = ASPEED_TIMER(dev);
+    Object *obj;
+    Error *err = NULL;
+
+    obj = object_property_get_link(OBJECT(dev), "scu", &err);
+    if (!obj) {
+        error_propagate(errp, err);
+        error_prepend(errp, "required link 'scu' not found: ");
+        return;
+    }
+    s->scu = ASPEED_SCU(obj);
 
     for (i = 0; i < ASPEED_TIMER_NR_TIMERS; i++) {
         aspeed_init_one_timer(s, i);
@@ -483,7 +515,7 @@ static const VMStateDescription vmstate_aspeed_timer_state = {
         VMSTATE_UINT32(ctrl, AspeedTimerCtrlState),
         VMSTATE_UINT32(ctrl2, AspeedTimerCtrlState),
         VMSTATE_STRUCT_ARRAY(timers, AspeedTimerCtrlState,
-                             ASPEED_TIMER_NR_TIMERS, 2, vmstate_aspeed_timer,
+                             ASPEED_TIMER_NR_TIMERS, 1, vmstate_aspeed_timer,
                              AspeedTimer),
         VMSTATE_END_OF_LIST()
     }

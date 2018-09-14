@@ -23,11 +23,6 @@
 
 #include "hw/hw.h"
 #include "hw/pci/pci.h"
-#include "hw/pci/msi.h"
-#include "hw/sysbus.h"
-#include "sysemu/dma.h"
-#include "hw/i386/pc.h"
-#include "hw/pci/pci_bus.h"
 #include "hw/i386/x86-iommu.h"
 
 /* Capability registers */
@@ -170,8 +165,8 @@
 #define AMDVI_DTE_UPPER_QUAD_RESERVED  0x08f0000000000000
 
 /* AMDVI paging mode */
-#define AMDVI_GATS_MODE                 (6ULL <<  12)
-#define AMDVI_HATS_MODE                 (6ULL <<  10)
+#define AMDVI_GATS_MODE                 (2ULL <<  12)
+#define AMDVI_HATS_MODE                 (2ULL <<  10)
 
 /* IOTLB */
 #define AMDVI_IOTLB_MAX_SIZE 1024
@@ -219,6 +214,8 @@
     OBJECT_CHECK(AMDVIState, (obj), TYPE_AMD_IOMMU_DEVICE)
 
 #define TYPE_AMD_IOMMU_PCI "AMDVI-PCI"
+
+#define TYPE_AMD_IOMMU_MEMORY_REGION "amd-iommu-iommu-memory-region"
 
 typedef struct AMDVIAddressSpace AMDVIAddressSpace;
 
@@ -275,9 +272,6 @@ typedef struct AMDVIState {
     uint8_t w1cmask[AMDVI_MMIO_SIZE];  /* read/write 1 clear mask      */
     uint8_t romask[AMDVI_MMIO_SIZE];   /* MMIO read/only mask          */
     bool mmio_enabled;
-
-    /* IOMMU function */
-    MemoryRegionIOMMUOps iommu_ops;
 
     /* for each served device */
     AMDVIAddressSpace **address_spaces[PCI_BUS_MAX];

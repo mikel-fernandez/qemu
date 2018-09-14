@@ -45,11 +45,11 @@ struct AioHandler
 
 static void aio_epoll_disable(AioContext *ctx)
 {
-    ctx->epoll_available = false;
-    if (!ctx->epoll_enabled) {
+    ctx->epoll_enabled = false;
+    if (!ctx->epoll_available) {
         return;
     }
-    ctx->epoll_enabled = false;
+    ctx->epoll_available = false;
     close(ctx->epollfd);
 }
 
@@ -119,7 +119,7 @@ static int aio_epoll(AioContext *ctx, GPollFD *pfds,
     }
     if (timeout <= 0 || ret > 0) {
         ret = epoll_wait(ctx->epollfd, events,
-                         sizeof(events) / sizeof(events[0]),
+                         ARRAY_SIZE(events),
                          timeout);
         if (ret <= 0) {
             goto out;
@@ -223,9 +223,16 @@ void aio_set_fd_handler(AioContext *ctx,
             return;
         }
 
-        g_source_remove_poll(&ctx->source, &node->pfd);
+        /* If the GSource is in the process of being destroyed then
+         * g_source_remove_poll() causes an assertion failure.  Skip
+         * removal in that case, because glib cleans up its state during
+         * destruction anyway.
+         */
+        if (!g_source_is_destroyed(&ctx->source)) {
+            g_source_remove_poll(&ctx->source, &node->pfd);
+        }
 
-        /* If the lock is held, just mark the node as deleted */
+        /* If a read is in progress, just mark the node as deleted */
         if (qemu_lockcnt_count(&ctx->list_lock)) {
             node->deleted = 1;
             node->pfd.revents = 0;
@@ -487,7 +494,8 @@ static bool run_poll_handlers_once(AioContext *ctx)
     QLIST_FOREACH_RCU(node, &ctx->aio_handlers, node) {
         if (!node->deleted && node->io_poll &&
             aio_node_check(ctx, node->is_external) &&
-            node->io_poll(node->opaque)) {
+            node->io_poll(node->opaque) &&
+            node->opaque != &ctx->notifier) {
             progress = true;
         }
 
@@ -583,6 +591,7 @@ bool aio_poll(AioContext *ctx, bool blocking)
      * so disable the optimization now.
      */
     if (blocking) {
+        assert(in_aio_context_home_thread(ctx));
         atomic_add(&ctx->notify_me, 2);
     }
 
@@ -625,6 +634,7 @@ bool aio_poll(AioContext *ctx, bool blocking)
 
     if (blocking) {
         atomic_sub(&ctx->notify_me, 2);
+        aio_notify_accept(ctx);
     }
 
     /* Adjust polling time */
@@ -668,8 +678,6 @@ bool aio_poll(AioContext *ctx, bool blocking)
         }
     }
 
-    aio_notify_accept(ctx);
-
     /* if we have any readable fds, dispatch event */
     if (ret > 0) {
         for (i = 0; i < npfd; i++) {
@@ -694,13 +702,6 @@ bool aio_poll(AioContext *ctx, bool blocking)
 
 void aio_context_setup(AioContext *ctx)
 {
-    /* TODO remove this in final patch submission */
-    if (getenv("QEMU_AIO_POLL_MAX_NS")) {
-        fprintf(stderr, "The QEMU_AIO_POLL_MAX_NS environment variable has "
-                "been replaced with -object iothread,poll-max-ns=NUM\n");
-        exit(1);
-    }
-
 #ifdef CONFIG_EPOLL_CREATE1
     assert(!ctx->epollfd);
     ctx->epollfd = epoll_create1(EPOLL_CLOEXEC);
@@ -710,6 +711,13 @@ void aio_context_setup(AioContext *ctx)
     } else {
         ctx->epoll_available = true;
     }
+#endif
+}
+
+void aio_context_destroy(AioContext *ctx)
+{
+#ifdef CONFIG_EPOLL_CREATE1
+    aio_epoll_disable(ctx);
 #endif
 }
 

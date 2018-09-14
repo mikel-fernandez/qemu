@@ -15,7 +15,11 @@
 #else
 #define TARGET_LONG_BITS 32
 #define TARGET_PHYS_ADDR_SPACE_BITS 40
-#define TARGET_VIRT_ADDR_SPACE_BITS 32
+# ifdef CONFIG_USER_ONLY
+#  define TARGET_VIRT_ADDR_SPACE_BITS 31
+# else
+#  define TARGET_VIRT_ADDR_SPACE_BITS 32
+#endif
 #endif
 
 /* Masks used to mark instructions to indicate which ISA level they
@@ -35,6 +39,7 @@
 #define   ISA_MIPS64R5  0x00001000
 #define   ISA_MIPS32R6  0x00002000
 #define   ISA_MIPS64R6  0x00004000
+#define   ISA_NANOMIPS32  0x00008000
 
 /* MIPS ASEs. */
 #define   ASE_MIPS16    0x00010000
@@ -82,6 +87,9 @@
 /* MIPS Technologies "Release 6" */
 #define CPU_MIPS32R6 (CPU_MIPS32R5 | ISA_MIPS32R6)
 #define CPU_MIPS64R6 (CPU_MIPS64R5 | CPU_MIPS32R6 | ISA_MIPS64R6)
+
+/* Wave Computing: "nanoMIPS" */
+#define CPU_NANOMIPS32 (CPU_MIPS32R6 | ISA_NANOMIPS32)
 
 /* Strictly follow the architecture standard:
    - Disallow "special" instruction handling for PMON/SPIM.

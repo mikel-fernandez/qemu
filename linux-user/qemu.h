@@ -18,8 +18,6 @@
 #include "exec/gdbstub.h"
 #include "qemu/queue.h"
 
-#define THREAD __thread
-
 /* This is the size of the host kernel's sigset_t, needed where we make
  * direct system calls that take a sigset_t pointer and a size.
  */
@@ -53,13 +51,16 @@ struct image_info {
         abi_ulong       file_string;
         uint32_t        elf_flags;
 	int		personality;
-#ifdef CONFIG_USE_FDPIC
+        abi_ulong       alignment;
+
+        /* The fields below are used in FDPIC mode.  */
         abi_ulong       loadmap_addr;
         uint16_t        nsegs;
         void           *loadsegs;
         abi_ulong       pt_dynamic_addr;
+        abi_ulong       interpreter_loadmap_addr;
+        abi_ulong       interpreter_pt_dynamic_addr;
         struct image_info *other_info;
-#endif
 };
 
 #ifdef TARGET_I386
@@ -102,9 +103,6 @@ typedef struct TaskState {
 # endif
     int swi_errno;
 #endif
-#ifdef TARGET_UNICORE32
-    int swi_errno;
-#endif
 #if defined(TARGET_I386) && !defined(TARGET_X86_64)
     abi_ulong target_v86;
     struct vm86_saved_state vm86_saved_regs;
@@ -117,7 +115,7 @@ typedef struct TaskState {
     int sim_syscalls;
     abi_ulong tp_value;
 #endif
-#if defined(TARGET_ARM) || defined(TARGET_M68K) || defined(TARGET_UNICORE32)
+#if defined(TARGET_ARM) || defined(TARGET_M68K)
     /* Extra fields for semihosted binaries.  */
     abi_ulong heap_base;
     abi_ulong heap_limit;
@@ -188,6 +186,14 @@ int loader_exec(int fdexec, const char *filename, char **argv, char **envp,
              struct target_pt_regs * regs, struct image_info *infop,
              struct linux_binprm *);
 
+/* Returns true if the image uses the FDPIC ABI. If this is the case,
+ * we have to provide some information (loadmap, pt_dynamic_info) such
+ * that the program can be relocated adequately. This is also useful
+ * when handling signals.
+ */
+int info_is_fdpic(struct image_info *info);
+
+uint32_t get_elf_eflags(int fd);
 int load_elf_binary(struct linux_binprm *bprm, struct image_info *info);
 int load_flt_binary(struct linux_binprm *bprm, struct image_info *info);
 
@@ -201,7 +207,7 @@ abi_long do_syscall(void *cpu_env, int num, abi_long arg1,
                     abi_long arg5, abi_long arg6, abi_long arg7,
                     abi_long arg8);
 void gemu_log(const char *fmt, ...) GCC_FMT_ATTR(1, 2);
-extern THREAD CPUState *thread_cpu;
+extern __thread CPUState *thread_cpu;
 void cpu_loop(CPUArchState *env);
 const char *target_strerror(int err);
 int get_osversion(void);
@@ -390,6 +396,8 @@ long do_sigreturn(CPUArchState *env);
 long do_rt_sigreturn(CPUArchState *env);
 abi_long do_sigaltstack(abi_ulong uss_addr, abi_ulong uoss_addr, abi_ulong sp);
 int do_sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+abi_long do_swapcontext(CPUArchState *env, abi_ulong uold_ctx,
+                        abi_ulong unew_ctx, abi_long ctx_size);
 /**
  * block_signals: block all signals while handling this guest syscall
  *
@@ -429,7 +437,6 @@ int target_munmap(abi_ulong start, abi_ulong len);
 abi_long target_mremap(abi_ulong old_addr, abi_ulong old_size,
                        abi_ulong new_size, unsigned long flags,
                        abi_ulong new_addr);
-int target_msync(abi_ulong start, abi_ulong len, int flags);
 extern unsigned long last_brk;
 extern abi_ulong mmap_next_start;
 abi_ulong mmap_find_vma(abi_ulong, abi_ulong);
@@ -614,12 +621,24 @@ static inline void *lock_user_string(abi_ulong guest_addr)
 
 #include <pthread.h>
 
+static inline int is_error(abi_long ret)
+{
+    return (abi_ulong)ret >= (abi_ulong)(-4096);
+}
+
+/**
+ * preexit_cleanup: housekeeping before the guest exits
+ *
+ * env: the CPU state
+ * code: the exit code
+ */
+void preexit_cleanup(CPUArchState *env, int code);
+
 /* Include target-specific struct and function definitions;
  * they may need access to the target-independent structures
  * above, so include them last.
  */
 #include "target_cpu.h"
-#include "target_signal.h"
 #include "target_structs.h"
 
 #endif /* QEMU_H */

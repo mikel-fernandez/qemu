@@ -25,9 +25,8 @@
 
 #include "qapi/error.h"
 #include "hw/hw.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 #include "hw/xen/xen_backend.h"
-#include "qapi/error.h"
 
 #include <xen/io/console.h>
 
@@ -150,7 +149,7 @@ static void xencons_send(struct XenConsole *con)
     ssize_t len, size;
 
     size = con->buffer.size - con->buffer.consumed;
-    if (qemu_chr_fe_get_driver(&con->chr)) {
+    if (qemu_chr_fe_backend_connected(&con->chr)) {
         len = qemu_chr_fe_write(&con->chr,
                                 con->buffer.data + con->buffer.consumed,
                                 size);
@@ -202,7 +201,7 @@ static int con_init(struct XenDevice *xendev)
     /* no Xen override, use qemu output device */
     if (output == NULL) {
         if (con->xendev.dev) {
-            qemu_chr_fe_init(&con->chr, serial_hds[con->xendev.dev],
+            qemu_chr_fe_init(&con->chr, serial_hd(con->xendev.dev),
                              &error_abort);
         }
     } else {
@@ -234,19 +233,18 @@ static int con_initialise(struct XenDevice *xendev)
     if (!xendev->dev) {
         xen_pfn_t mfn = con->ring_ref;
         con->sring = xenforeignmemory_map(xen_fmem, con->xendev.dom,
-                                          PROT_READ|PROT_WRITE,
+                                          PROT_READ | PROT_WRITE,
                                           1, &mfn, NULL);
     } else {
-        con->sring = xengnttab_map_grant_ref(xendev->gnttabdev, con->xendev.dom,
-                                             con->ring_ref,
-                                             PROT_READ|PROT_WRITE);
+        con->sring = xen_be_map_grant_ref(xendev, con->ring_ref,
+                                          PROT_READ | PROT_WRITE);
     }
     if (!con->sring)
 	return -1;
 
     xen_be_bind_evtchn(&con->xendev);
     qemu_chr_fe_set_handlers(&con->chr, xencons_can_receive,
-                             xencons_receive, NULL, con, NULL, true);
+                             xencons_receive, NULL, NULL, con, NULL, true);
 
     xen_pv_printf(xendev, 1,
                   "ring mfn %d, remote port %d, local port %d, limit %zd\n",
@@ -261,14 +259,14 @@ static void con_disconnect(struct XenDevice *xendev)
 {
     struct XenConsole *con = container_of(xendev, struct XenConsole, xendev);
 
-    qemu_chr_fe_deinit(&con->chr);
+    qemu_chr_fe_deinit(&con->chr, false);
     xen_pv_unbind_evtchn(&con->xendev);
 
     if (con->sring) {
         if (!xendev->dev) {
             xenforeignmemory_unmap(xen_fmem, con->sring, 1);
         } else {
-            xengnttab_unmap(xendev->gnttabdev, con->sring, 1);
+            xen_be_unmap_grant_ref(xendev, con->sring);
         }
         con->sring = NULL;
     }

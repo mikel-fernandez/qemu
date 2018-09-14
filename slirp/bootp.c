@@ -123,6 +123,9 @@ static void dhcp_decode(const struct bootp_t *bp, int *pmsg_type,
             if (p >= p_end)
                 break;
             len = *p++;
+            if (p + len > p_end) {
+                break;
+            }
             DPRINTF("dhcp: tag=%d len=%d\n", tag, len);
 
             switch(tag) {
@@ -292,6 +295,14 @@ static void bootp_reply(Slirp *slirp, const struct bootp_t *bp)
             *q++ = RFC1533_HOSTNAME;
             *q++ = val;
             memcpy(q, slirp->client_hostname, val);
+            q += val;
+        }
+
+        if (slirp->vdomainname) {
+            val = strlen(slirp->vdomainname);
+            *q++ = RFC1533_DOMAINNAME;
+            *q++ = val;
+            memcpy(q, slirp->vdomainname, val);
             q += val;
         }
 

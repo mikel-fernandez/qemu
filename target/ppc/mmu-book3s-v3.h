@@ -22,8 +22,19 @@
 
 #ifndef CONFIG_USER_ONLY
 
+/*
+ * Partition table definitions
+ */
+#define PTCR_PATB               0x0FFFFFFFFFFFF000ULL /* Partition Table Base */
+#define PTCR_PATS               0x000000000000001FULL /* Partition Table Size */
+
 /* Partition Table Entry Fields */
 #define PATBE1_GR 0x8000000000000000
+
+/* Process Table Entry */
+struct prtb_entry {
+    uint64_t prtbe0, prtbe1;
+};
 
 #ifdef TARGET_PPC64
 

@@ -24,6 +24,7 @@
  * THE SOFTWARE.
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "hw/hw.h"
 #include "hw/ppc/ppc.h"
@@ -34,24 +35,28 @@
 #include "net/net.h"
 #include "hw/isa/isa.h"
 #include "hw/pci/pci.h"
+#include "hw/pci/pci_host.h"
 #include "hw/boards.h"
 #include "hw/nvram/fw_cfg.h"
 #include "hw/char/escc.h"
+#include "hw/misc/macio/macio.h"
 #include "hw/ide.h"
 #include "hw/loader.h"
 #include "elf.h"
 #include "qemu/error-report.h"
 #include "sysemu/kvm.h"
 #include "kvm_ppc.h"
-#include "sysemu/block-backend.h"
 #include "exec/address-spaces.h"
-#include "qemu/cutils.h"
 
 #define MAX_IDE_BUS 2
 #define CFG_ADDR 0xf0000510
 #define TBFREQ 16600000UL
 #define CLOCKFREQ 266000000UL
 #define BUSFREQ 66000000UL
+
+#define NDRV_VGA_FILENAME "qemu_vga.ndrv"
+
+#define GRACKLE_BASE 0xfec00000
 
 static void fw_cfg_boot_set(void *opaque, const char *boot_device,
                             Error **errp)
@@ -62,11 +67,6 @@ static void fw_cfg_boot_set(void *opaque, const char *boot_device,
 static uint64_t translate_kernel_address(void *opaque, uint64_t addr)
 {
     return (addr & 0x0fffffff) + KERNEL_LOAD_ADDR;
-}
-
-static hwaddr round_page(hwaddr addr)
-{
-    return (addr + TARGET_PAGE_SIZE - 1) & TARGET_PAGE_MASK;
 }
 
 static void ppc_heathrow_reset(void *opaque)
@@ -87,21 +87,19 @@ static void ppc_heathrow_init(MachineState *machine)
     PowerPCCPU *cpu = NULL;
     CPUPPCState *env = NULL;
     char *filename;
-    qemu_irq *pic, **heathrow_irqs;
     int linux_boot, i;
     MemoryRegion *ram = g_new(MemoryRegion, 1);
     MemoryRegion *bios = g_new(MemoryRegion, 1);
-    MemoryRegion *isa = g_new(MemoryRegion, 1);
     uint32_t kernel_base, initrd_base, cmdline_base = 0;
     int32_t kernel_size, initrd_size;
     PCIBus *pci_bus;
-    PCIDevice *macio;
+    OldWorldMacIOState *macio;
     MACIOIDEState *macio_ide;
-    DeviceState *dev;
+    SysBusDevice *s;
+    DeviceState *dev, *pic_dev;
     BusState *adb_bus;
-    int bios_size;
-    MemoryRegion *pic_mem;
-    MemoryRegion *escc_mem, *escc_bar = g_new(MemoryRegion, 1);
+    int bios_size, ndrv_size;
+    uint8_t *ndrv_file;
     uint16_t ppc_boot_device;
     DriveInfo *hd[MAX_IDE_BUS * MAX_IDE_DEVS];
     void *fw_cfg;
@@ -110,14 +108,8 @@ static void ppc_heathrow_init(MachineState *machine)
     linux_boot = (kernel_filename != NULL);
 
     /* init CPUs */
-    if (machine->cpu_model == NULL)
-        machine->cpu_model = "G3";
     for (i = 0; i < smp_cpus; i++) {
-        cpu = cpu_ppc_init(machine->cpu_model);
-        if (cpu == NULL) {
-            fprintf(stderr, "Unable to find PowerPC CPU definition\n");
-            exit(1);
-        }
+        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
         env = &cpu->env;
 
         /* Set time-base frequency to 16.6 Mhz */
@@ -126,10 +118,9 @@ static void ppc_heathrow_init(MachineState *machine)
     }
 
     /* allocate RAM */
-    if (ram_size > (2047 << 20)) {
-        fprintf(stderr,
-                "qemu: Too much memory for this machine: %d MB, maximum 2047 MB\n",
-                ((unsigned int)ram_size / (1 << 20)));
+    if (ram_size > 2047 * MiB) {
+        error_report("Too much memory for this machine: %" PRId64 " MB, "
+                     "maximum 2047 MB", ram_size / MiB);
         exit(1);
     }
 
@@ -140,7 +131,6 @@ static void ppc_heathrow_init(MachineState *machine)
     /* allocate and load BIOS */
     memory_region_init_ram(bios, NULL, "ppc_heathrow.bios", BIOS_SIZE,
                            &error_fatal);
-    vmstate_register_ram_global(bios);
 
     if (bios_name == NULL)
         bios_name = PROM_FILENAME;
@@ -188,7 +178,7 @@ static void ppc_heathrow_init(MachineState *machine)
         }
         /* load initrd */
         if (initrd_filename) {
-            initrd_base = round_page(kernel_base + kernel_size + KERNEL_GAP);
+            initrd_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
             initrd_size = load_image_targphys(initrd_filename, initrd_base,
                                               ram_size - initrd_base);
             if (initrd_size < 0) {
@@ -196,11 +186,11 @@ static void ppc_heathrow_init(MachineState *machine)
                              initrd_filename);
                 exit(1);
             }
-            cmdline_base = round_page(initrd_base + initrd_size);
+            cmdline_base = TARGET_PAGE_ALIGN(initrd_base + initrd_size);
         } else {
             initrd_base = 0;
             initrd_size = 0;
-            cmdline_base = round_page(kernel_base + kernel_size + KERNEL_GAP);
+            cmdline_base = TARGET_PAGE_ALIGN(kernel_base + kernel_size + KERNEL_GAP);
         }
         ppc_boot_device = 'm';
     } else {
@@ -227,27 +217,21 @@ static void ppc_heathrow_init(MachineState *machine)
 #endif
         }
         if (ppc_boot_device == '\0') {
-            fprintf(stderr, "No valid boot device for G3 Beige machine\n");
+            error_report("No valid boot device for G3 Beige machine");
             exit(1);
         }
     }
 
-    /* Register 2 MB of ISA IO space */
-    memory_region_init_alias(isa, NULL, "isa_mmio",
-                             get_system_io(), 0, 0x00200000);
-    memory_region_add_subregion(sysmem, 0xfe000000, isa);
-
     /* XXX: we register only 1 output pin for heathrow PIC */
-    heathrow_irqs = g_malloc0(smp_cpus * sizeof(qemu_irq *));
-    heathrow_irqs[0] =
-        g_malloc0(smp_cpus * sizeof(qemu_irq) * 1);
+    pic_dev = qdev_create(NULL, TYPE_HEATHROW);
+    qdev_init_nofail(pic_dev);
+
     /* Connect the heathrow PIC outputs to the 6xx bus */
     for (i = 0; i < smp_cpus; i++) {
         switch (PPC_INPUT(env)) {
         case PPC_FLAGS_INPUT_6xx:
-            heathrow_irqs[i] = heathrow_irqs[0] + (i * 1);
-            heathrow_irqs[i][0] =
-                ((qemu_irq *)env->irq_inputs)[PPC6xx_INPUT_INT];
+            qdev_connect_gpio_out(pic_dev, 0,
+                ((qemu_irq *)env->irq_inputs)[PPC6xx_INPUT_INT]);
             break;
         default:
             error_report("Bus model not supported on OldWorld Mac machine");
@@ -267,32 +251,39 @@ static void ppc_heathrow_init(MachineState *machine)
         error_report("Only 6xx bus is supported on heathrow machine");
         exit(1);
     }
-    pic = heathrow_pic_init(&pic_mem, 1, heathrow_irqs);
-    pci_bus = pci_grackle_init(0xfec00000, pic,
-                               get_system_memory(),
-                               get_system_io());
+
+    /* Grackle PCI host bridge */
+    dev = qdev_create(NULL, TYPE_GRACKLE_PCI_HOST_BRIDGE);
+    object_property_set_link(OBJECT(dev), OBJECT(pic_dev), "pic",
+                             &error_abort);
+    qdev_init_nofail(dev);
+    s = SYS_BUS_DEVICE(dev);
+    sysbus_mmio_map(s, 0, GRACKLE_BASE);
+    sysbus_mmio_map(s, 1, GRACKLE_BASE + 0x200000);
+    /* PCI hole */
+    memory_region_add_subregion(get_system_memory(), 0x80000000ULL,
+                                sysbus_mmio_get_region(s, 2));
+    /* Register 2 MB of ISA IO space */
+    memory_region_add_subregion(get_system_memory(), 0xfe000000,
+                                sysbus_mmio_get_region(s, 3));
+
+    pci_bus = PCI_HOST_BRIDGE(dev)->bus;
+
     pci_vga_init(pci_bus);
 
-    escc_mem = escc_init(0, pic[0x0f], pic[0x10], serial_hds[0],
-                               serial_hds[1], ESCC_CLOCK, 4);
-    memory_region_init_alias(escc_bar, NULL, "escc-bar",
-                             escc_mem, 0, memory_region_size(escc_mem));
-
-    for(i = 0; i < nb_nics; i++)
+    for (i = 0; i < nb_nics; i++) {
         pci_nic_init_nofail(&nd_table[i], pci_bus, "ne2k_pci", NULL);
-
+    }
 
     ide_drive_get(hd, ARRAY_SIZE(hd));
 
-    macio = pci_create(pci_bus, -1, TYPE_OLDWORLD_MACIO);
+    /* MacIO */
+    macio = OLDWORLD_MACIO(pci_create(pci_bus, -1, TYPE_OLDWORLD_MACIO));
     dev = DEVICE(macio);
-    qdev_connect_gpio_out(dev, 0, pic[0x12]); /* CUDA */
-    qdev_connect_gpio_out(dev, 1, pic[0x0D]); /* IDE-0 */
-    qdev_connect_gpio_out(dev, 2, pic[0x02]); /* IDE-0 DMA */
-    qdev_connect_gpio_out(dev, 3, pic[0x0E]); /* IDE-1 */
-    qdev_connect_gpio_out(dev, 4, pic[0x03]); /* IDE-1 DMA */
     qdev_prop_set_uint64(dev, "frequency", tbfreq);
-    macio_init(macio, pic_mem, escc_bar);
+    object_property_set_link(OBJECT(macio), OBJECT(pic_dev), "pic",
+                             &error_abort);
+    qdev_init_nofail(dev);
 
     macio_ide = MACIO_IDE(object_resolve_path_component(OBJECT(macio),
                                                         "ide[0]"));
@@ -318,7 +309,17 @@ static void ppc_heathrow_init(MachineState *machine)
 
     /* No PCI init: the BIOS will do it */
 
-    fw_cfg = fw_cfg_init_mem(CFG_ADDR, CFG_ADDR + 2);
+    dev = qdev_create(NULL, TYPE_FW_CFG_MEM);
+    fw_cfg = FW_CFG(dev);
+    qdev_prop_set_uint32(dev, "data_width", 1);
+    qdev_prop_set_bit(dev, "dma_enabled", false);
+    object_property_add_child(OBJECT(qdev_get_machine()), TYPE_FW_CFG,
+                              OBJECT(fw_cfg), NULL);
+    qdev_init_nofail(dev);
+    s = SYS_BUS_DEVICE(dev);
+    sysbus_mmio_map(s, 0, CFG_ADDR);
+    sysbus_mmio_map(s, 1, CFG_ADDR + 2);
+
     fw_cfg_add_i16(fw_cfg, FW_CFG_NB_CPUS, (uint16_t)smp_cpus);
     fw_cfg_add_i16(fw_cfg, FW_CFG_MAX_CPUS, (uint16_t)max_cpus);
     fw_cfg_add_i64(fw_cfg, FW_CFG_RAM_SIZE, (uint64_t)ram_size);
@@ -355,6 +356,19 @@ static void ppc_heathrow_init(MachineState *machine)
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_CLOCKFREQ, CLOCKFREQ);
     fw_cfg_add_i32(fw_cfg, FW_CFG_PPC_BUSFREQ, BUSFREQ);
 
+    /* MacOS NDRV VGA driver */
+    filename = qemu_find_file(QEMU_FILE_TYPE_BIOS, NDRV_VGA_FILENAME);
+    if (filename) {
+        ndrv_size = get_image_size(filename);
+        if (ndrv_size != -1) {
+            ndrv_file = g_malloc(ndrv_size);
+            ndrv_size = load_image(filename, ndrv_file);
+
+            fw_cfg_add_file(fw_cfg, "ndrv/qemu_vga.ndrv", ndrv_file, ndrv_size);
+        }
+        g_free(filename);
+    }
+
     qemu_register_boot_set(fw_cfg_boot_set, fw_cfg);
 }
 
@@ -364,8 +378,10 @@ static int heathrow_kvm_type(const char *arg)
     return 2;
 }
 
-static void heathrow_machine_init(MachineClass *mc)
+static void heathrow_class_init(ObjectClass *oc, void *data)
 {
+    MachineClass *mc = MACHINE_CLASS(oc);
+
     mc->desc = "Heathrow based PowerMAC";
     mc->init = ppc_heathrow_init;
     mc->block_default_type = IF_IDE;
@@ -376,6 +392,19 @@ static void heathrow_machine_init(MachineClass *mc)
     /* TOFIX "cad" when Mac floppy is implemented */
     mc->default_boot_order = "cd";
     mc->kvm_type = heathrow_kvm_type;
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("750_v3.1");
+    mc->default_display = "std";
 }
 
-DEFINE_MACHINE("g3beige", heathrow_machine_init)
+static const TypeInfo ppc_heathrow_machine_info = {
+    .name          = MACHINE_TYPE_NAME("g3beige"),
+    .parent        = TYPE_MACHINE,
+    .class_init    = heathrow_class_init
+};
+
+static void ppc_heathrow_register_types(void)
+{
+    type_register_static(&ppc_heathrow_machine_info);
+}
+
+type_init(ppc_heathrow_register_types);

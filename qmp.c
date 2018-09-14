@@ -16,12 +16,12 @@
 #include "qemu/osdep.h"
 #include "qemu-version.h"
 #include "qemu/cutils.h"
+#include "qemu/option.h"
 #include "monitor/monitor.h"
 #include "sysemu/sysemu.h"
 #include "qemu/config-file.h"
 #include "qemu/uuid.h"
-#include "qmp-commands.h"
-#include "sysemu/char.h"
+#include "chardev/char.h"
 #include "ui/qemu-spice.h"
 #include "ui/vnc.h"
 #include "sysemu/kvm.h"
@@ -30,12 +30,16 @@
 #include "sysemu/blockdev.h"
 #include "sysemu/block-backend.h"
 #include "qom/qom-qobject.h"
+#include "qapi/error.h"
+#include "qapi/qapi-commands-block-core.h"
+#include "qapi/qapi-commands-misc.h"
+#include "qapi/qapi-commands-ui.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qerror.h"
-#include "qapi/qmp/qobject.h"
 #include "qapi/qobject-input-visitor.h"
 #include "hw/boards.h"
 #include "qom/object_interfaces.h"
-#include "hw/mem/pc-dimm.h"
+#include "hw/mem/memory-device.h"
 #include "hw/acpi/acpi_dev_interface.h"
 
 NameInfo *qmp_query_name(Error **errp)
@@ -84,7 +88,7 @@ UuidInfo *qmp_query_uuid(Error **errp)
 void qmp_quit(Error **errp)
 {
     no_shutdown = 0;
-    qemu_system_shutdown_request();
+    qemu_system_shutdown_request(SHUTDOWN_CAUSE_HOST_QMP);
 }
 
 void qmp_stop(Error **errp)
@@ -105,17 +109,12 @@ void qmp_stop(Error **errp)
 
 void qmp_system_reset(Error **errp)
 {
-    qemu_system_reset_request();
+    qemu_system_reset_request(SHUTDOWN_CAUSE_HOST_QMP);
 }
 
 void qmp_system_powerdown(Error **erp)
 {
     qemu_system_powerdown_request();
-}
-
-void qmp_cpu(int64_t index, Error **errp)
-{
-    /* Just do nothing */
 }
 
 void qmp_cpu_add(int64_t id, Error **errp)
@@ -130,44 +129,20 @@ void qmp_cpu_add(int64_t id, Error **errp)
     }
 }
 
-#ifndef CONFIG_VNC
-/* If VNC support is enabled, the "true" query-vnc command is
-   defined in the VNC subsystem */
-VncInfo *qmp_query_vnc(Error **errp)
+void qmp_x_exit_preconfig(Error **errp)
 {
-    error_setg(errp, QERR_FEATURE_DISABLED, "vnc");
-    return NULL;
-};
-
-VncInfo2List *qmp_query_vnc_servers(Error **errp)
-{
-    error_setg(errp, QERR_FEATURE_DISABLED, "vnc");
-    return NULL;
-};
-#endif
-
-#ifndef CONFIG_SPICE
-/*
- * qmp-commands.hx ensures that QMP command query-spice exists only
- * #ifdef CONFIG_SPICE.  Necessary for an accurate query-commands
- * result.  However, the QAPI schema is blissfully unaware of that,
- * and the QAPI code generator happily generates a dead
- * qmp_marshal_query_spice() that calls qmp_query_spice().  Provide it
- * one, or else linking fails.  FIXME Educate the QAPI schema on
- * CONFIG_SPICE.
- */
-SpiceInfo *qmp_query_spice(Error **errp)
-{
-    abort();
-};
-#endif
+    if (!runstate_check(RUN_STATE_PRECONFIG)) {
+        error_setg(errp, "The command is permitted only in '%s' state",
+                   RunState_str(RUN_STATE_PRECONFIG));
+        return;
+    }
+    qemu_exit_preconfig_request();
+}
 
 void qmp_cont(Error **errp)
 {
-    Error *local_err = NULL;
     BlockBackend *blk;
-    BlockDriverState *bs;
-    BdrvNextIterator it;
+    Error *local_err = NULL;
 
     /* if there is a dump in background, we should wait until the dump
      * finished */
@@ -187,27 +162,13 @@ void qmp_cont(Error **errp)
         blk_iostatus_reset(blk);
     }
 
-    for (bs = bdrv_first(&it); bs; bs = bdrv_next(&it)) {
-        bdrv_add_key(bs, NULL, &local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
-        }
-    }
-
     /* Continuing after completed migration. Images have been inactivated to
-     * allow the destination to take control. Need to get control back now. */
-    if (runstate_check(RUN_STATE_FINISH_MIGRATE) ||
-        runstate_check(RUN_STATE_POSTMIGRATE))
-    {
-        bdrv_invalidate_cache_all(&local_err);
-        if (local_err) {
-            error_propagate(errp, local_err);
-            return;
-        }
-    }
-
-    blk_resume_after_migration(&local_err);
+     * allow the destination to take control. Need to get control back now.
+     *
+     * If there are no inactive block nodes (e.g. because the VM was just
+     * paused rather than completing a migration), bdrv_inactivate_all() simply
+     * doesn't do anything. */
+    bdrv_invalidate_cache_all(&local_err);
     if (local_err) {
         error_propagate(errp, local_err);
         return;
@@ -419,23 +380,17 @@ static void qmp_change_vnc(const char *target, bool has_arg, const char *arg,
         qmp_change_vnc_listen(target, errp);
     }
 }
-#else
-void qmp_change_vnc_password(const char *password, Error **errp)
-{
-    error_setg(errp, QERR_FEATURE_DISABLED, "vnc");
-}
-static void qmp_change_vnc(const char *target, bool has_arg, const char *arg,
-                           Error **errp)
-{
-    error_setg(errp, QERR_FEATURE_DISABLED, "vnc");
-}
 #endif /* !CONFIG_VNC */
 
 void qmp_change(const char *device, const char *target,
                 bool has_arg, const char *arg, Error **errp)
 {
     if (strcmp(device, "vnc") == 0) {
+#ifdef CONFIG_VNC
         qmp_change_vnc(target, has_arg, arg, errp);
+#else
+        error_setg(errp, QERR_FEATURE_DISABLED, "vnc");
+#endif
     } else {
         qmp_blockdev_change_medium(true, device, false, NULL, target,
                                    has_arg, arg, false, 0, errp);
@@ -446,9 +401,15 @@ static void qom_list_types_tramp(ObjectClass *klass, void *data)
 {
     ObjectTypeInfoList *e, **pret = data;
     ObjectTypeInfo *info;
+    ObjectClass *parent = object_class_get_parent(klass);
 
     info = g_malloc0(sizeof(*info));
     info->name = g_strdup(object_class_get_name(klass));
+    info->has_abstract = info->abstract = object_class_is_abstract(klass);
+    if (parent) {
+        info->has_parent = true;
+        info->parent = g_strdup(object_class_get_name(parent));
+    }
 
     e = g_malloc0(sizeof(*e));
     e->value = info;
@@ -476,12 +437,12 @@ ObjectTypeInfoList *qmp_qom_list_types(bool has_implements,
  *
  * The caller must free the return value.
  */
-static DevicePropertyInfo *make_device_property_info(ObjectClass *klass,
-                                                     const char *name,
-                                                     const char *default_type,
-                                                     const char *description)
+static ObjectPropertyInfo *make_device_property_info(ObjectClass *klass,
+                                                  const char *name,
+                                                  const char *default_type,
+                                                  const char *description)
 {
-    DevicePropertyInfo *info;
+    ObjectPropertyInfo *info;
     Property *prop;
 
     do {
@@ -496,13 +457,14 @@ static DevicePropertyInfo *make_device_property_info(ObjectClass *klass,
              * for removal.  This conditional should be removed along with
              * it.
              */
-            if (!prop->info->set) {
+            if (!prop->info->set && !prop->info->create) {
                 return NULL;           /* no way to set it, don't show */
             }
 
             info = g_malloc0(sizeof(*info));
             info->name = g_strdup(prop->name);
-            info->type = g_strdup(prop->info->name);
+            info->type = default_type ? g_strdup(default_type)
+                                      : g_strdup(prop->info->name);
             info->has_description = !!prop->info->description;
             info->description = g_strdup(prop->info->description);
             return info;
@@ -520,14 +482,14 @@ static DevicePropertyInfo *make_device_property_info(ObjectClass *klass,
     return info;
 }
 
-DevicePropertyInfoList *qmp_device_list_properties(const char *typename,
-                                                   Error **errp)
+ObjectPropertyInfoList *qmp_device_list_properties(const char *typename,
+                                                Error **errp)
 {
     ObjectClass *klass;
     Object *obj;
     ObjectProperty *prop;
     ObjectPropertyIterator iter;
-    DevicePropertyInfoList *prop_list = NULL;
+    ObjectPropertyInfoList *prop_list = NULL;
 
     klass = object_class_by_name(typename);
     if (klass == NULL) {
@@ -548,17 +510,12 @@ DevicePropertyInfoList *qmp_device_list_properties(const char *typename,
         return NULL;
     }
 
-    if (DEVICE_CLASS(klass)->cannot_destroy_with_object_finalize_yet) {
-        error_setg(errp, "Can't list properties of device '%s'", typename);
-        return NULL;
-    }
-
     obj = object_new(typename);
 
     object_property_iter_init(&iter, obj);
     while ((prop = object_property_iter_next(&iter))) {
-        DevicePropertyInfo *info;
-        DevicePropertyInfoList *entry;
+        ObjectPropertyInfo *info;
+        ObjectPropertyInfoList *entry;
 
         /* Skip Object and DeviceState properties */
         if (strcmp(prop->name, "type") == 0 ||
@@ -581,6 +538,55 @@ DevicePropertyInfoList *qmp_device_list_properties(const char *typename,
         if (!info) {
             continue;
         }
+
+        entry = g_malloc0(sizeof(*entry));
+        entry->value = info;
+        entry->next = prop_list;
+        prop_list = entry;
+    }
+
+    object_unref(obj);
+
+    return prop_list;
+}
+
+ObjectPropertyInfoList *qmp_qom_list_properties(const char *typename,
+                                             Error **errp)
+{
+    ObjectClass *klass;
+    Object *obj = NULL;
+    ObjectProperty *prop;
+    ObjectPropertyIterator iter;
+    ObjectPropertyInfoList *prop_list = NULL;
+
+    klass = object_class_by_name(typename);
+    if (klass == NULL) {
+        error_set(errp, ERROR_CLASS_DEVICE_NOT_FOUND,
+                  "Class '%s' not found", typename);
+        return NULL;
+    }
+
+    klass = object_class_dynamic_cast(klass, TYPE_OBJECT);
+    if (klass == NULL) {
+        error_setg(errp, QERR_INVALID_PARAMETER_VALUE, "typename", TYPE_OBJECT);
+        return NULL;
+    }
+
+    if (object_class_is_abstract(klass)) {
+        object_class_property_iter_init(&iter, klass);
+    } else {
+        obj = object_new(typename);
+        object_property_iter_init(&iter, obj);
+    }
+    while ((prop = object_property_iter_next(&iter))) {
+        ObjectPropertyInfo *info;
+        ObjectPropertyInfoList *entry;
+
+        info = g_malloc0(sizeof(*info));
+        info->name = g_strdup(prop->name);
+        info->type = g_strdup(prop->type);
+        info->has_description = !!prop->description;
+        info->description = g_strdup(prop->description);
 
         entry = g_malloc0(sizeof(*entry));
         entry->value = info;
@@ -671,12 +677,12 @@ void qmp_object_add(const char *type, const char *id,
     Object *obj;
 
     if (props) {
-        pdict = qobject_to_qdict(props);
+        pdict = qobject_to(QDict, props);
         if (!pdict) {
             error_setg(errp, QERR_INVALID_PARAMETER_TYPE, "props", "dict");
             return;
         }
-        QINCREF(pdict);
+        qobject_ref(pdict);
     } else {
         pdict = qdict_new();
     }
@@ -687,7 +693,7 @@ void qmp_object_add(const char *type, const char *id,
     if (obj) {
         object_unref(obj);
     }
-    QDECREF(pdict);
+    qobject_unref(pdict);
 }
 
 void qmp_object_del(const char *id, Error **errp)
@@ -697,12 +703,7 @@ void qmp_object_del(const char *id, Error **errp)
 
 MemoryDeviceInfoList *qmp_query_memory_devices(Error **errp)
 {
-    MemoryDeviceInfoList *head = NULL;
-    MemoryDeviceInfoList **prev = &head;
-
-    qmp_pc_dimm_device_list(qdev_get_machine(), &prev);
-
-    return head;
+    return qmp_memory_device_list();
 }
 
 ACPIOSTInfoList *qmp_query_acpi_ospm_status(Error **errp)
@@ -722,4 +723,17 @@ ACPIOSTInfoList *qmp_query_acpi_ospm_status(Error **errp)
     }
 
     return head;
+}
+
+MemoryInfo *qmp_query_memory_size_summary(Error **errp)
+{
+    MemoryInfo *mem_info = g_malloc0(sizeof(MemoryInfo));
+
+    mem_info->base_memory = ram_size;
+
+    mem_info->plugged_memory = get_plugged_memory_size();
+    mem_info->has_plugged_memory =
+        mem_info->plugged_memory != (uint64_t)-1;
+
+    return mem_info;
 }

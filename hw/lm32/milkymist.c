@@ -18,6 +18,8 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
+#include "qemu/error-report.h"
 #include "qemu-common.h"
 #include "cpu.h"
 #include "hw/sysbus.h"
@@ -29,15 +31,13 @@
 #include "hw/boards.h"
 #include "hw/loader.h"
 #include "elf.h"
-#include "sysemu/block-backend.h"
 #include "milkymist-hw.h"
 #include "lm32.h"
 #include "exec/address-spaces.h"
-#include "qemu/cutils.h"
 
 #define BIOS_FILENAME    "mmone-bios.bin"
 #define BIOS_OFFSET      0x00860000
-#define BIOS_SIZE        (512*1024)
+#define BIOS_SIZE        (512 * KiB)
 #define KERNEL_LOAD_ADDR 0x40000000
 
 typedef struct {
@@ -80,7 +80,6 @@ static void main_cpu_reset(void *opaque)
 static void
 milkymist_init(MachineState *machine)
 {
-    const char *cpu_model = machine->cpu_model;
     const char *kernel_filename = machine->kernel_filename;
     const char *kernel_cmdline = machine->kernel_cmdline;
     const char *initrd_filename = machine->initrd_filename;
@@ -97,10 +96,10 @@ milkymist_init(MachineState *machine)
 
     /* memory map */
     hwaddr flash_base   = 0x00000000;
-    size_t flash_sector_size        = 128 * 1024;
-    size_t flash_size               = 32 * 1024 * 1024;
+    size_t flash_sector_size        = 128 * KiB;
+    size_t flash_size               = 32 * MiB;
     hwaddr sdram_base   = 0x40000000;
-    size_t sdram_size               = 128 * 1024 * 1024;
+    size_t sdram_size               = 128 * MiB;
 
     hwaddr initrd_base  = sdram_base + 0x1002000;
     hwaddr cmdline_base = sdram_base + 0x1000000;
@@ -108,14 +107,7 @@ milkymist_init(MachineState *machine)
 
     reset_info = g_malloc0(sizeof(ResetInfo));
 
-    if (cpu_model == NULL) {
-        cpu_model = "lm32-full";
-    }
-    cpu = cpu_lm32_init(cpu_model);
-    if (cpu == NULL) {
-        fprintf(stderr, "qemu: unable to find CPU '%s'\n", cpu_model);
-        exit(1);
-    }
+    cpu = LM32_CPU(cpu_create(machine->cpu_type));
 
     env = &cpu->env;
     reset_info->cpu = cpu;
@@ -153,13 +145,12 @@ milkymist_init(MachineState *machine)
 
     /* if no kernel is given no valid bios rom is a fatal error */
     if (!kernel_filename && !dinfo && !bios_filename && !qtest_enabled()) {
-        fprintf(stderr, "qemu: could not load Milkymist One bios '%s'\n",
-                bios_name);
+        error_report("could not load Milkymist One bios '%s'", bios_name);
         exit(1);
     }
     g_free(bios_filename);
 
-    milkymist_uart_create(0x60000000, irq[0], serial_hds[0]);
+    milkymist_uart_create(0x60000000, irq[0], serial_hd(0));
     milkymist_sysctl_create(0x60001000, irq[1], irq[2], irq[3],
             80000000, 0x10014d31, 0x0000041f, 0x00000001);
     milkymist_hpdmc_create(0x60002000);
@@ -175,7 +166,7 @@ milkymist_init(MachineState *machine)
             0x20000000, 0x1000, 0x20020000, 0x2000);
 
     /* make sure juart isn't the first chardev */
-    env->juart_state = lm32_juart_init(serial_hds[1]);
+    env->juart_state = lm32_juart_init(serial_hd(1));
 
     if (kernel_filename) {
         uint64_t entry;
@@ -192,8 +183,7 @@ milkymist_init(MachineState *machine)
         }
 
         if (kernel_size < 0) {
-            fprintf(stderr, "qemu: could not load kernel '%s'\n",
-                    kernel_filename);
+            error_report("could not load kernel '%s'", kernel_filename);
             exit(1);
         }
     }
@@ -220,6 +210,7 @@ static void milkymist_machine_init(MachineClass *mc)
     mc->desc = "Milkymist One";
     mc->init = milkymist_init;
     mc->is_default = 0;
+    mc->default_cpu_type = LM32_CPU_TYPE_NAME("lm32-full");
 }
 
 DEFINE_MACHINE("milkymist", milkymist_machine_init)

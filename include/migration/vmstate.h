@@ -27,58 +27,6 @@
 #ifndef QEMU_VMSTATE_H
 #define QEMU_VMSTATE_H
 
-#ifndef CONFIG_USER_ONLY
-#include "migration/qemu-file.h"
-#endif
-#include "migration/qjson.h"
-
-typedef void SaveStateHandler(QEMUFile *f, void *opaque);
-typedef int LoadStateHandler(QEMUFile *f, void *opaque, int version_id);
-
-typedef struct SaveVMHandlers {
-    /* This runs inside the iothread lock.  */
-    void (*set_params)(const MigrationParams *params, void * opaque);
-    SaveStateHandler *save_state;
-
-    void (*cleanup)(void *opaque);
-    int (*save_live_complete_postcopy)(QEMUFile *f, void *opaque);
-    int (*save_live_complete_precopy)(QEMUFile *f, void *opaque);
-
-    /* This runs both outside and inside the iothread lock.  */
-    bool (*is_active)(void *opaque);
-
-    /* This runs outside the iothread lock in the migration case, and
-     * within the lock in the savevm case.  The callback had better only
-     * use data that is local to the migration thread or protected
-     * by other locks.
-     */
-    int (*save_live_iterate)(QEMUFile *f, void *opaque);
-
-    /* This runs outside the iothread lock!  */
-    int (*save_live_setup)(QEMUFile *f, void *opaque);
-    void (*save_live_pending)(QEMUFile *f, void *opaque, uint64_t max_size,
-                              uint64_t *non_postcopiable_pending,
-                              uint64_t *postcopiable_pending);
-    LoadStateHandler *load_state;
-} SaveVMHandlers;
-
-int register_savevm(DeviceState *dev,
-                    const char *idstr,
-                    int instance_id,
-                    int version_id,
-                    SaveStateHandler *save_state,
-                    LoadStateHandler *load_state,
-                    void *opaque);
-
-int register_savevm_live(DeviceState *dev,
-                         const char *idstr,
-                         int instance_id,
-                         int version_id,
-                         SaveVMHandlers *ops,
-                         void *opaque);
-
-void unregister_savevm(DeviceState *dev, const char *idstr, void *opaque);
-
 typedef struct VMStateInfo VMStateInfo;
 typedef struct VMStateDescription VMStateDescription;
 typedef struct VMStateField VMStateField;
@@ -193,16 +141,25 @@ enum VMStateFlags {
      * to determine the number of entries in the array. Only valid in
      * combination with one of VMS_VARRAY*. */
     VMS_MULTIPLY_ELEMENTS = 0x4000,
+
+    /* A structure field that is like VMS_STRUCT, but uses
+     * VMStateField.struct_version_id to tell which version of the
+     * structure we are referencing to use. */
+    VMS_VSTRUCT           = 0x8000,
 };
 
 typedef enum {
     MIG_PRI_DEFAULT = 0,
     MIG_PRI_IOMMU,              /* Must happen before PCI devices */
+    MIG_PRI_PCI_BUS,            /* Must happen before IOMMU */
+    MIG_PRI_GICV3_ITS,          /* Must happen before PCI devices */
+    MIG_PRI_GICV3,              /* Must happen before the ITS */
     MIG_PRI_MAX,
 } MigrationPriority;
 
 struct VMStateField {
     const char *name;
+    const char *err_hint;
     size_t offset;
     size_t size;
     size_t start;
@@ -213,6 +170,7 @@ struct VMStateField {
     enum VMStateFlags flags;
     const VMStateDescription *vmsd;
     int version_id;
+    int struct_version_id;
     bool (*field_exists)(void *opaque, int version_id);
 };
 
@@ -226,7 +184,7 @@ struct VMStateDescription {
     LoadStateHandler *load_state_old;
     int (*pre_load)(void *opaque);
     int (*post_load)(void *opaque, int version_id);
-    void (*pre_save)(void *opaque);
+    int (*pre_save)(void *opaque);
     bool (*needed)(void *opaque);
     VMStateField *fields;
     const VMStateDescription **subsections;
@@ -294,8 +252,39 @@ extern const VMStateInfo vmstate_info_qtailq;
     vmstate_offset_array(_state, _field, uint8_t,                    \
                          sizeof(typeof_field(_state, _field)))
 
+/* In the macros below, if there is a _version, that means the macro's
+ * field will be processed only if the version being received is >=
+ * the _version specified.  In general, if you add a new field, you
+ * would increment the structure's version and put that version
+ * number into the new field so it would only be processed with the
+ * new version.
+ *
+ * In particular, for VMSTATE_STRUCT() and friends the _version does
+ * *NOT* pick the version of the sub-structure.  It works just as
+ * specified above.  The version of the top-level structure received
+ * is passed down to all sub-structures.  This means that the
+ * sub-structures must have version that are compatible with all the
+ * structures that use them.
+ *
+ * If you want to specify the version of the sub-structure, use
+ * VMSTATE_VSTRUCT(), which allows the specific sub-structure version
+ * to be directly specified.
+ */
+
 #define VMSTATE_SINGLE_TEST(_field, _state, _test, _version, _info, _type) { \
     .name         = (stringify(_field)),                             \
+    .version_id   = (_version),                                      \
+    .field_exists = (_test),                                         \
+    .size         = sizeof(_type),                                   \
+    .info         = &(_info),                                        \
+    .flags        = VMS_SINGLE,                                      \
+    .offset       = vmstate_offset_value(_state, _field, _type),     \
+}
+
+#define VMSTATE_SINGLE_FULL(_field, _state, _test, _version, _info,  \
+                            _type, _err_hint) {                      \
+    .name         = (stringify(_field)),                             \
+    .err_hint     = (_err_hint),                                     \
     .version_id   = (_version),                                      \
     .field_exists = (_test),                                         \
     .size         = sizeof(_type),                                   \
@@ -429,6 +418,17 @@ extern const VMStateInfo vmstate_info_qtailq;
     .offset     = offsetof(_state, _field),                          \
 }
 
+#define VMSTATE_VSTRUCT_TEST(_field, _state, _test, _version, _vmsd, _type, _struct_version) { \
+    .name         = (stringify(_field)),                             \
+    .version_id   = (_version),                                      \
+    .struct_version_id = (_struct_version),                          \
+    .field_exists = (_test),                                         \
+    .vmsd         = &(_vmsd),                                        \
+    .size         = sizeof(_type),                                   \
+    .flags        = VMS_VSTRUCT,                                     \
+    .offset       = vmstate_offset_value(_state, _field, _type),     \
+}
+
 #define VMSTATE_STRUCT_TEST(_field, _state, _test, _version, _vmsd, _type) { \
     .name         = (stringify(_field)),                             \
     .version_id   = (_version),                                      \
@@ -497,6 +497,19 @@ extern const VMStateInfo vmstate_info_qtailq;
     .size         = sizeof(_type),                                   \
     .flags        = VMS_STRUCT|VMS_ARRAY,                            \
     .offset       = vmstate_offset_array(_state, _field, _type, _num),\
+}
+
+#define VMSTATE_STRUCT_2DARRAY_TEST(_field, _state, _n1, _n2, _test, \
+                                    _version, _vmsd, _type) {        \
+    .name         = (stringify(_field)),                             \
+    .num          = (_n1) * (_n2),                                   \
+    .field_exists = (_test),                                         \
+    .version_id   = (_version),                                      \
+    .vmsd         = &(_vmsd),                                        \
+    .size         = sizeof(_type),                                   \
+    .flags        = VMS_STRUCT | VMS_ARRAY,                          \
+    .offset       = vmstate_offset_2darray(_state, _field, _type,    \
+                                           _n1, _n2),                \
 }
 
 #define VMSTATE_STRUCT_VARRAY_UINT8(_field, _state, _field_num, _version, _vmsd, _type) { \
@@ -733,6 +746,13 @@ extern const VMStateInfo vmstate_info_qtailq;
 #define VMSTATE_SINGLE(_field, _state, _version, _info, _type)        \
     VMSTATE_SINGLE_TEST(_field, _state, NULL, _version, _info, _type)
 
+#define VMSTATE_VSTRUCT(_field, _state, _vmsd, _type, _struct_version)\
+    VMSTATE_VSTRUCT_TEST(_field, _state, NULL, 0, _vmsd, _type, _struct_version)
+
+#define VMSTATE_VSTRUCT_V(_field, _state, _version, _vmsd, _type, _struct_version) \
+    VMSTATE_VSTRUCT_TEST(_field, _state, NULL, _version, _vmsd, _type, \
+                         _struct_version)
+
 #define VMSTATE_STRUCT(_field, _state, _version, _vmsd, _type)        \
     VMSTATE_STRUCT_TEST(_field, _state, NULL, _version, _vmsd, _type)
 
@@ -745,6 +765,11 @@ extern const VMStateInfo vmstate_info_qtailq;
 #define VMSTATE_STRUCT_ARRAY(_field, _state, _num, _version, _vmsd, _type) \
     VMSTATE_STRUCT_ARRAY_TEST(_field, _state, _num, NULL, _version,   \
             _vmsd, _type)
+
+#define VMSTATE_STRUCT_2DARRAY(_field, _state, _n1, _n2, _version,    \
+            _vmsd, _type)                                             \
+    VMSTATE_STRUCT_2DARRAY_TEST(_field, _state, _n1, _n2, NULL,       \
+            _version, _vmsd, _type)
 
 #define VMSTATE_BUFFER_UNSAFE_INFO(_field, _state, _version, _info, _size) \
     VMSTATE_BUFFER_UNSAFE_INFO_TEST(_field, _state, NULL, _version, _info, \
@@ -792,29 +817,35 @@ extern const VMStateInfo vmstate_info_qtailq;
 #define VMSTATE_UINT64(_f, _s)                                        \
     VMSTATE_UINT64_V(_f, _s, 0)
 
-#define VMSTATE_UINT8_EQUAL(_f, _s)                                   \
-    VMSTATE_SINGLE(_f, _s, 0, vmstate_info_uint8_equal, uint8_t)
+#define VMSTATE_UINT8_EQUAL(_f, _s, _err_hint)                        \
+    VMSTATE_SINGLE_FULL(_f, _s, 0, 0,                                 \
+                        vmstate_info_uint8_equal, uint8_t, _err_hint)
 
-#define VMSTATE_UINT16_EQUAL(_f, _s)                                  \
-    VMSTATE_SINGLE(_f, _s, 0, vmstate_info_uint16_equal, uint16_t)
+#define VMSTATE_UINT16_EQUAL(_f, _s, _err_hint)                       \
+    VMSTATE_SINGLE_FULL(_f, _s, 0, 0,                                 \
+                        vmstate_info_uint16_equal, uint16_t, _err_hint)
 
-#define VMSTATE_UINT16_EQUAL_V(_f, _s, _v)                            \
-    VMSTATE_SINGLE(_f, _s, _v, vmstate_info_uint16_equal, uint16_t)
+#define VMSTATE_UINT16_EQUAL_V(_f, _s, _v, _err_hint)                 \
+    VMSTATE_SINGLE_FULL(_f, _s, 0,  _v,                               \
+                        vmstate_info_uint16_equal, uint16_t, _err_hint)
 
-#define VMSTATE_INT32_EQUAL(_f, _s)                                   \
-    VMSTATE_SINGLE(_f, _s, 0, vmstate_info_int32_equal, int32_t)
+#define VMSTATE_INT32_EQUAL(_f, _s, _err_hint)                        \
+    VMSTATE_SINGLE_FULL(_f, _s, 0, 0,                                 \
+                        vmstate_info_int32_equal, int32_t, _err_hint)
 
-#define VMSTATE_UINT32_EQUAL_V(_f, _s, _v)                            \
-    VMSTATE_SINGLE(_f, _s, _v, vmstate_info_uint32_equal, uint32_t)
+#define VMSTATE_UINT32_EQUAL_V(_f, _s, _v, _err_hint)                 \
+    VMSTATE_SINGLE_FULL(_f, _s, 0,  _v,                               \
+                        vmstate_info_uint32_equal, uint32_t, _err_hint)
 
-#define VMSTATE_UINT32_EQUAL(_f, _s)                                  \
-    VMSTATE_UINT32_EQUAL_V(_f, _s, 0)
+#define VMSTATE_UINT32_EQUAL(_f, _s, _err_hint)                       \
+    VMSTATE_UINT32_EQUAL_V(_f, _s, 0, _err_hint)
 
-#define VMSTATE_UINT64_EQUAL_V(_f, _s, _v)                            \
-    VMSTATE_SINGLE(_f, _s, _v, vmstate_info_uint64_equal, uint64_t)
+#define VMSTATE_UINT64_EQUAL_V(_f, _s, _v, _err_hint)                 \
+    VMSTATE_SINGLE_FULL(_f, _s, 0,  _v,                               \
+                        vmstate_info_uint64_equal, uint64_t, _err_hint)
 
-#define VMSTATE_UINT64_EQUAL(_f, _s)                                  \
-    VMSTATE_UINT64_EQUAL_V(_f, _s, 0)
+#define VMSTATE_UINT64_EQUAL(_f, _s, _err_hint)                       \
+    VMSTATE_UINT64_EQUAL_V(_f, _s, 0, _err_hint)
 
 #define VMSTATE_INT32_POSITIVE_LE(_f, _s)                             \
     VMSTATE_SINGLE(_f, _s, 0, vmstate_info_int32_le, int32_t)
@@ -880,6 +911,9 @@ extern const VMStateInfo vmstate_info_qtailq;
 #define VMSTATE_BOOL_ARRAY(_f, _s, _n)                               \
     VMSTATE_BOOL_ARRAY_V(_f, _s, _n, 0)
 
+#define VMSTATE_BOOL_SUB_ARRAY(_f, _s, _start, _num)                \
+    VMSTATE_SUB_ARRAY(_f, _s, _start, _num, 0, vmstate_info_bool, bool)
+
 #define VMSTATE_UINT16_ARRAY_V(_f, _s, _n, _v)                         \
     VMSTATE_ARRAY(_f, _s, _n, _v, vmstate_info_uint16, uint16_t)
 
@@ -888,6 +922,9 @@ extern const VMStateInfo vmstate_info_qtailq;
 
 #define VMSTATE_UINT16_ARRAY(_f, _s, _n)                               \
     VMSTATE_UINT16_ARRAY_V(_f, _s, _n, 0)
+
+#define VMSTATE_UINT16_SUB_ARRAY(_f, _s, _start, _num)                \
+    VMSTATE_SUB_ARRAY(_f, _s, _start, _num, 0, vmstate_info_uint16, uint16_t)
 
 #define VMSTATE_UINT16_2DARRAY(_f, _s, _n1, _n2)                      \
     VMSTATE_UINT16_2DARRAY_V(_f, _s, _n1, _n2, 0)
@@ -916,6 +953,9 @@ extern const VMStateInfo vmstate_info_qtailq;
 #define VMSTATE_UINT32_ARRAY(_f, _s, _n)                              \
     VMSTATE_UINT32_ARRAY_V(_f, _s, _n, 0)
 
+#define VMSTATE_UINT32_SUB_ARRAY(_f, _s, _start, _num)                \
+    VMSTATE_SUB_ARRAY(_f, _s, _start, _num, 0, vmstate_info_uint32, uint32_t)
+
 #define VMSTATE_UINT32_2DARRAY(_f, _s, _n1, _n2)                      \
     VMSTATE_UINT32_2DARRAY_V(_f, _s, _n1, _n2, 0)
 
@@ -924,6 +964,9 @@ extern const VMStateInfo vmstate_info_qtailq;
 
 #define VMSTATE_UINT64_ARRAY(_f, _s, _n)                              \
     VMSTATE_UINT64_ARRAY_V(_f, _s, _n, 0)
+
+#define VMSTATE_UINT64_SUB_ARRAY(_f, _s, _start, _num)                \
+    VMSTATE_SUB_ARRAY(_f, _s, _start, _num, 0, vmstate_info_uint64, uint64_t)
 
 #define VMSTATE_UINT64_2DARRAY(_f, _s, _n1, _n2)                      \
     VMSTATE_UINT64_2DARRAY_V(_f, _s, _n1, _n2, 0)
@@ -942,9 +985,6 @@ extern const VMStateInfo vmstate_info_qtailq;
 
 #define VMSTATE_INT32_ARRAY(_f, _s, _n)                               \
     VMSTATE_INT32_ARRAY_V(_f, _s, _n, 0)
-
-#define VMSTATE_UINT32_SUB_ARRAY(_f, _s, _start, _num)                \
-    VMSTATE_SUB_ARRAY(_f, _s, _start, _num, 0, vmstate_info_uint32, uint32_t)
 
 #define VMSTATE_INT64_ARRAY_V(_f, _s, _n, _v)                         \
     VMSTATE_ARRAY(_f, _s, _n, _v, vmstate_info_int64, int64_t)
@@ -1003,14 +1043,12 @@ extern const VMStateInfo vmstate_info_qtailq;
 #define VMSTATE_END_OF_LIST()                                         \
     {}
 
-#define SELF_ANNOUNCE_ROUNDS 5
-
-void loadvm_free_handlers(MigrationIncomingState *mis);
-
 int vmstate_load_state(QEMUFile *f, const VMStateDescription *vmsd,
                        void *opaque, int version_id);
-void vmstate_save_state(QEMUFile *f, const VMStateDescription *vmsd,
-                        void *opaque, QJSON *vmdesc);
+int vmstate_save_state(QEMUFile *f, const VMStateDescription *vmsd,
+                       void *opaque, QJSON *vmdesc);
+int vmstate_save_state_v(QEMUFile *f, const VMStateDescription *vmsd,
+                         void *opaque, QJSON *vmdesc, int version_id);
 
 bool vmstate_save_needed(const VMStateDescription *vmsd, void *opaque);
 
@@ -1038,14 +1076,6 @@ void vmstate_register_ram(struct MemoryRegion *memory, DeviceState *dev);
 void vmstate_unregister_ram(struct MemoryRegion *memory, DeviceState *dev);
 void vmstate_register_ram_global(struct MemoryRegion *memory);
 
-static inline
-int64_t self_announce_delay(int round)
-{
-    assert(round < SELF_ANNOUNCE_ROUNDS && round > 0);
-    /* delay 50ms, 150ms, 250ms, ... */
-    return 50 + (SELF_ANNOUNCE_ROUNDS - round - 1) * 100;
-}
-
-void dump_vmstate_json_to_file(FILE *out_fp);
+bool vmstate_check_only_migratable(const VMStateDescription *vmsd);
 
 #endif

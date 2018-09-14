@@ -71,6 +71,7 @@ void aio_set_fd_handler(AioContext *ctx,
         }
     } else {
         HANDLE event;
+        long bitmask = 0;
 
         if (node == NULL) {
             /* Alloc and insert if it's not already there */
@@ -95,10 +96,16 @@ void aio_set_fd_handler(AioContext *ctx,
         node->io_write = io_write;
         node->is_external = is_external;
 
+        if (io_read) {
+            bitmask |= FD_READ | FD_ACCEPT | FD_CLOSE;
+        }
+
+        if (io_write) {
+            bitmask |= FD_WRITE | FD_CONNECT;
+        }
+
         event = event_notifier_get_handle(&ctx->notifier);
-        WSAEventSelect(node->pfd.fd, event,
-                       FD_READ | FD_ACCEPT | FD_CLOSE |
-                       FD_CONNECT | FD_WRITE | FD_OOB);
+        WSAEventSelect(node->pfd.fd, event, bitmask);
     }
 
     qemu_lockcnt_unlock(&ctx->list_lock);
@@ -366,11 +373,12 @@ bool aio_poll(AioContext *ctx, bool blocking)
         ret = WaitForMultipleObjects(count, events, FALSE, timeout);
         if (blocking) {
             assert(first);
+            assert(in_aio_context_home_thread(ctx));
             atomic_sub(&ctx->notify_me, 2);
+            aio_notify_accept(ctx);
         }
 
         if (first) {
-            aio_notify_accept(ctx);
             progress |= aio_bh_poll(ctx);
             first = false;
         }
@@ -400,8 +408,14 @@ void aio_context_setup(AioContext *ctx)
 {
 }
 
+void aio_context_destroy(AioContext *ctx)
+{
+}
+
 void aio_context_set_poll_params(AioContext *ctx, int64_t max_ns,
                                  int64_t grow, int64_t shrink, Error **errp)
 {
-    error_setg(errp, "AioContext polling is not implemented on Windows");
+    if (max_ns) {
+        error_setg(errp, "AioContext polling is not implemented on Windows");
+    }
 }

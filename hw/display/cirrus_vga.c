@@ -27,11 +27,11 @@
  *   available at http://home.worldonline.dk/~finth/
  */
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "trace.h"
 #include "hw/hw.h"
 #include "hw/pci/pci.h"
-#include "ui/console.h"
 #include "ui/pixel_ops.h"
 #include "vga_int.h"
 #include "hw/loader.h"
@@ -1426,7 +1426,8 @@ static void cirrus_vga_write_sr(CirrusVGAState * s, uint32_t val)
         s->vga.hw_cursor_y = (val << 3) | (s->vga.sr_index >> 5);
 	break;
     case 0x07:			// Extended Sequencer Mode
-    cirrus_update_memory_access(s);
+        cirrus_update_memory_access(s);
+        /* fall through */
     case 0x08:			// EEPROM Control
     case 0x09:			// Scratch Register 0
     case 0x0a:			// Scratch Register 1
@@ -2038,15 +2039,14 @@ static void cirrus_mem_writeb_mode4and5_8bpp(CirrusVGAState * s,
     unsigned val = mem_value;
     uint8_t *dst;
 
-    dst = s->vga.vram_ptr + (offset &= s->cirrus_addr_mask);
     for (x = 0; x < 8; x++) {
+        dst = s->vga.vram_ptr + ((offset + x) & s->cirrus_addr_mask);
 	if (val & 0x80) {
 	    *dst = s->cirrus_shadow_gr1;
 	} else if (mode == 5) {
 	    *dst = s->cirrus_shadow_gr0;
 	}
 	val <<= 1;
-	dst++;
     }
     memory_region_set_dirty(&s->vga.vram, offset, 8);
 }
@@ -2060,8 +2060,8 @@ static void cirrus_mem_writeb_mode4and5_16bpp(CirrusVGAState * s,
     unsigned val = mem_value;
     uint8_t *dst;
 
-    dst = s->vga.vram_ptr + (offset &= s->cirrus_addr_mask);
     for (x = 0; x < 8; x++) {
+        dst = s->vga.vram_ptr + ((offset + 2 * x) & s->cirrus_addr_mask & ~1);
 	if (val & 0x80) {
 	    *dst = s->cirrus_shadow_gr1;
 	    *(dst + 1) = s->vga.gr[0x11];
@@ -2070,7 +2070,6 @@ static void cirrus_mem_writeb_mode4and5_16bpp(CirrusVGAState * s,
 	    *(dst + 1) = s->vga.gr[0x10];
 	}
 	val <<= 1;
-	dst += 2;
     }
     memory_region_set_dirty(&s->vga.vram, offset, 16);
 }
@@ -2221,7 +2220,7 @@ static inline void cirrus_cursor_compute_yrange(CirrusVGAState *s)
     uint32_t content;
     int y, y_min, y_max;
 
-    src = s->vga.vram_ptr + s->real_vram_size - 16 * 1024;
+    src = s->vga.vram_ptr + s->real_vram_size - 16 * KiB;
     if (s->vga.sr[0x12] & CIRRUS_CURSOR_LARGE) {
         src += (s->vga.sr[0x13] & 0x3c) * 256;
         y_min = 64;
@@ -2350,7 +2349,7 @@ static void cirrus_cursor_draw_line(VGACommonState *s1, uint8_t *d1, int scr_y)
         return;
     }
 
-    src = s->vga.vram_ptr + s->real_vram_size - 16 * 1024;
+    src = s->vga.vram_ptr + s->real_vram_size - 16 * KiB;
     if (s->vga.sr[0x12] & CIRRUS_CURSOR_LARGE) {
         src += (s->vga.sr[0x13] & 0x3c) * 256;
         src += (scr_y - s->vga.hw_cursor_y) * 16;
@@ -2998,8 +2997,7 @@ static void cirrus_init_common(CirrusVGAState *s, Object *owner,
 
     /* I/O handler for LFB */
     memory_region_init_io(&s->cirrus_linear_io, owner, &cirrus_linear_io_ops, s,
-                          "cirrus-linear-io", s->vga.vram_size_mb
-                                              * 1024 * 1024);
+                          "cirrus-linear-io", s->vga.vram_size_mb * MiB);
     memory_region_set_flush_coalesced(&s->cirrus_linear_io);
 
     /* I/O handler for LFB */
@@ -3016,7 +3014,7 @@ static void cirrus_init_common(CirrusVGAState *s, Object *owner,
     memory_region_set_flush_coalesced(&s->cirrus_mmio_io);
 
     s->real_vram_size =
-        (s->device_id == CIRRUS_ID_CLGD5446) ? 4096 * 1024 : 2048 * 1024;
+        (s->device_id == CIRRUS_ID_CLGD5446) ? 4 * MiB : 2 * MiB;
 
     /* XXX: s->vga.vram_size must be a power of two */
     s->cirrus_addr_mask = s->real_vram_size - 1;
@@ -3051,7 +3049,8 @@ static void isa_cirrus_vga_realizefn(DeviceState *dev, Error **errp)
                    s->vram_size_mb);
         return;
     }
-    vga_common_init(s, OBJECT(dev), true);
+    s->global_vmstate = true;
+    vga_common_init(s, OBJECT(dev));
     cirrus_init_common(&d->cirrus_vga, OBJECT(dev), CIRRUS_ID_CLGD5430, 0,
                        isa_address_space(isadev),
                        isa_address_space_io(isadev));
@@ -3065,7 +3064,7 @@ static Property isa_cirrus_vga_properties[] = {
     DEFINE_PROP_UINT32("vgamem_mb", struct ISACirrusVGAState,
                        cirrus_vga.vga.vram_size_mb, 4),
     DEFINE_PROP_BOOL("blitter", struct ISACirrusVGAState,
-                       cirrus_vga.enable_blitter, true),
+                     cirrus_vga.enable_blitter, true),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -3108,7 +3107,7 @@ static void pci_cirrus_vga_realize(PCIDevice *dev, Error **errp)
          return;
      }
      /* setup VGA */
-     vga_common_init(&s->vga, OBJECT(dev), true);
+     vga_common_init(&s->vga, OBJECT(dev));
      cirrus_init_common(s, OBJECT(dev), device_id, 1, pci_address_space(dev),
                         pci_address_space_io(dev));
      s->vga.con = graphic_console_init(DEVICE(dev), 0, s->vga.hw_ops, &s->vga);
@@ -3137,6 +3136,8 @@ static Property pci_vga_cirrus_properties[] = {
                        cirrus_vga.vga.vram_size_mb, 4),
     DEFINE_PROP_BOOL("blitter", struct PCICirrusVGAState,
                      cirrus_vga.enable_blitter, true),
+    DEFINE_PROP_BOOL("global-vmstate", struct PCICirrusVGAState,
+                     cirrus_vga.vga.global_vmstate, false),
     DEFINE_PROP_END_OF_LIST(),
 };
 
@@ -3162,6 +3163,10 @@ static const TypeInfo cirrus_vga_info = {
     .parent        = TYPE_PCI_DEVICE,
     .instance_size = sizeof(PCICirrusVGAState),
     .class_init    = cirrus_vga_class_init,
+    .interfaces = (InterfaceInfo[]) {
+        { INTERFACE_CONVENTIONAL_PCI_DEVICE },
+        { },
+    },
 };
 
 static void cirrus_vga_register_types(void)

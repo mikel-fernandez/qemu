@@ -10,6 +10,7 @@
  * This work is licensed under the terms of the GNU GPL, version 2 or later.
  * See the COPYING file in the top-level directory.
  */
+
 #include "qemu/osdep.h"
 #include <getopt.h>
 #include <glib/gstdio.h>
@@ -17,19 +18,21 @@
 #include <syslog.h>
 #include <sys/wait.h>
 #endif
-#include "qapi/qmp/json-streamer.h"
 #include "qapi/qmp/json-parser.h"
-#include "qapi/qmp/qint.h"
+#include "qapi/qmp/qdict.h"
 #include "qapi/qmp/qjson.h"
-#include "qga/guest-agent-core.h"
+#include "qapi/qmp/qstring.h"
+#include "guest-agent-core.h"
 #include "qemu/module.h"
+#include "qga-qapi-commands.h"
 #include "qapi/qmp/qerror.h"
-#include "qapi/qmp/dispatch.h"
-#include "qga/channel.h"
+#include "qapi/error.h"
+#include "channel.h"
 #include "qemu/bswap.h"
 #include "qemu/help_option.h"
 #include "qemu/sockets.h"
 #include "qemu/systemd.h"
+#include "qemu-version.h"
 #ifdef _WIN32
 #include "qga/service-win32.h"
 #include "qga/vss-win32.h"
@@ -131,9 +134,32 @@ static void quit_handler(int sig)
      * unless all log/pid files are on unfreezable filesystems. there's
      * also a very likely chance killing the agent before unfreezing
      * the filesystems is a mistake (or will be viewed as one later).
+     * On Windows the freeze interval is limited to 10 seconds, so
+     * we should quit, but first we should wait for the timeout, thaw
+     * the filesystem and quit.
      */
     if (ga_is_frozen(ga_state)) {
+#ifdef _WIN32
+        int i = 0;
+        Error *err = NULL;
+        HANDLE hEventTimeout;
+
+        g_debug("Thawing filesystems before exiting");
+
+        hEventTimeout = OpenEvent(EVENT_ALL_ACCESS, FALSE, EVENT_NAME_TIMEOUT);
+        if (hEventTimeout) {
+            WaitForSingleObject(hEventTimeout, 0);
+            CloseHandle(hEventTimeout);
+        }
+        qga_vss_fsfreeze(&i, false, &err);
+        if (err) {
+            g_debug("Error unfreezing filesystems prior to exiting: %s",
+                error_get_pretty(err));
+            error_free(err);
+        }
+#else
         return;
+#endif
     }
     g_debug("received signal num %d, quitting", sig);
 
@@ -191,7 +217,8 @@ static void usage(const char *cmd)
 {
     printf(
 "Usage: %s [-m <method> -p <path>] [<options>]\n"
-"QEMU Guest Agent %s\n"
+"QEMU Guest Agent " QEMU_FULL_VERSION "\n"
+QEMU_COPYRIGHT "\n"
 "\n"
 "  -m, --method      transport method: one of unix-listen, virtio-serial,\n"
 "                    isa-serial, or vsock-listen (virtio-serial is the default)\n"
@@ -225,8 +252,8 @@ static void usage(const char *cmd)
 "                    options / command-line parameters to stdout\n"
 "  -h, --help        display this help and exit\n"
 "\n"
-"Report bugs to <mdroth@linux.vnet.ibm.com>\n"
-    , cmd, QEMU_VERSION, QGA_VIRTIO_PATH_DEFAULT, QGA_SERIAL_PATH_DEFAULT,
+QEMU_HELP_BOTTOM "\n"
+    , cmd, QGA_VIRTIO_PATH_DEFAULT, QGA_SERIAL_PATH_DEFAULT,
     dfl_pathnames.pidfile,
 #ifdef CONFIG_FSFREEZE
     QGA_FSFREEZE_HOOK_DEFAULT,
@@ -517,7 +544,7 @@ fail:
 #endif
 }
 
-static int send_response(GAState *s, QObject *payload)
+static int send_response(GAState *s, QDict *payload)
 {
     const char *buf;
     QString *payload_qstr, *response_qstr;
@@ -525,7 +552,7 @@ static int send_response(GAState *s, QObject *payload)
 
     g_assert(payload && s->channel);
 
-    payload_qstr = qobject_to_json(payload);
+    payload_qstr = qobject_to_json(QOBJECT(payload));
     if (!payload_qstr) {
         return -EINVAL;
     }
@@ -535,7 +562,7 @@ static int send_response(GAState *s, QObject *payload)
         response_qstr = qstring_new();
         qstring_append_chr(response_qstr, QGA_SENTINEL_BYTE);
         qstring_append(response_qstr, qstring_get_str(payload_qstr));
-        QDECREF(payload_qstr);
+        qobject_unref(payload_qstr);
     } else {
         response_qstr = payload_qstr;
     }
@@ -543,7 +570,7 @@ static int send_response(GAState *s, QObject *payload)
     qstring_append_chr(response_qstr, '\n');
     buf = qstring_get_str(response_qstr);
     status = ga_channel_write_all(s->channel, buf, strlen(buf));
-    QDECREF(response_qstr);
+    qobject_unref(response_qstr);
     if (status != G_IO_STATUS_NORMAL) {
         return -EIO;
     }
@@ -553,65 +580,57 @@ static int send_response(GAState *s, QObject *payload)
 
 static void process_command(GAState *s, QDict *req)
 {
-    QObject *rsp = NULL;
+    QDict *rsp;
     int ret;
 
     g_assert(req);
     g_debug("processing command");
-    rsp = qmp_dispatch(&ga_commands, QOBJECT(req));
+    rsp = qmp_dispatch(&ga_commands, QOBJECT(req), false);
     if (rsp) {
         ret = send_response(s, rsp);
         if (ret < 0) {
             g_warning("error sending response: %s", strerror(-ret));
         }
-        qobject_decref(rsp);
+        qobject_unref(rsp);
     }
 }
 
 /* handle requests/control events coming in over the channel */
-static void process_event(JSONMessageParser *parser, GQueue *tokens)
+static void process_event(void *opaque, QObject *obj, Error *err)
 {
-    GAState *s = container_of(parser, GAState, parser);
-    QDict *qdict;
-    Error *err = NULL;
+    GAState *s = opaque;
+    QDict *req, *rsp;
     int ret;
 
-    g_assert(s && parser);
-
     g_debug("process_event: called");
-    qdict = qobject_to_qdict(json_parser_parse_err(tokens, NULL, &err));
-    if (err || !qdict) {
-        QDECREF(qdict);
-        qdict = qdict_new();
-        if (!err) {
-            g_warning("failed to parse event: unknown error");
-            error_setg(&err, QERR_JSON_PARSING);
-        } else {
-            g_warning("failed to parse event: %s", error_get_pretty(err));
-        }
-        qdict_put_obj(qdict, "error", qmp_build_error_object(err));
-        error_free(err);
+    assert(!obj != !err);
+    if (err) {
+        goto err;
+    }
+    req = qobject_to(QDict, obj);
+    if (!req) {
+        error_setg(&err, "Input must be a JSON object");
+        goto err;
+    }
+    if (!qdict_haskey(req, "execute")) {
+        g_warning("unrecognized payload format");
+        error_setg(&err, QERR_UNSUPPORTED);
+        goto err;
     }
 
-    /* handle host->guest commands */
-    if (qdict_haskey(qdict, "execute")) {
-        process_command(s, qdict);
-    } else {
-        if (!qdict_haskey(qdict, "error")) {
-            QDECREF(qdict);
-            qdict = qdict_new();
-            g_warning("unrecognized payload format");
-            error_setg(&err, QERR_UNSUPPORTED);
-            qdict_put_obj(qdict, "error", qmp_build_error_object(err));
-            error_free(err);
-        }
-        ret = send_response(s, QOBJECT(qdict));
-        if (ret < 0) {
-            g_warning("error sending error response: %s", strerror(-ret));
-        }
-    }
+    process_command(s, req);
+    qobject_unref(obj);
+    return;
 
-    QDECREF(qdict);
+err:
+    g_warning("failed to parse event: %s", error_get_pretty(err));
+    rsp = qmp_error_response(err);
+    ret = send_response(s, rsp);
+    if (ret < 0) {
+        g_warning("error sending error response: %s", strerror(-ret));
+    }
+    qobject_unref(rsp);
+    qobject_unref(obj);
 }
 
 /* false return signals GAChannel to close the current client connection */
@@ -1052,7 +1071,12 @@ static void config_dump(GAConfig *config)
     g_free(tmp);
 
     tmp = g_key_file_to_data(keyfile, NULL, &error);
-    printf("%s", tmp);
+    if (error) {
+        g_critical("Failed to dump keyfile: %s", error->message);
+        g_clear_error(&error);
+    } else {
+        printf("%s", tmp);
+    }
 
     g_free(tmp);
     g_key_file_free(keyfile);
@@ -1291,8 +1315,8 @@ static int run_agent(GAState *s, GAConfig *config, int socket_activation)
     s->command_state = ga_command_state_new();
     ga_command_state_init(s, s->command_state);
     ga_command_state_init_all(s->command_state);
-    json_message_parser_init(&s->parser, process_event);
-    ga_state = s;
+    json_message_parser_init(&s->parser, process_event, s, NULL);
+
 #ifndef _WIN32
     if (!register_signal_handlers()) {
         g_critical("failed to register signal handlers");
@@ -1365,9 +1389,9 @@ int main(int argc, char **argv)
 
         addr = socket_local_address(FIRST_SOCKET_ACTIVATION_FD, NULL);
         if (addr) {
-            if (addr->type == SOCKET_ADDRESS_KIND_UNIX) {
+            if (addr->type == SOCKET_ADDRESS_TYPE_UNIX) {
                 config->method = g_strdup("unix-listen");
-            } else if (addr->type == SOCKET_ADDRESS_KIND_VSOCK) {
+            } else if (addr->type == SOCKET_ADDRESS_TYPE_VSOCK) {
                 config->method = g_strdup("vsock-listen");
             }
 

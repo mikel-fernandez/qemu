@@ -15,7 +15,6 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "elf.h"
-#include "exec/cpu-all.h"
 #include "sysemu/dump.h"
 #include "sysemu/kvm.h"
 
@@ -50,7 +49,7 @@ struct PPCUserRegStruct {
 struct PPCElfPrstatus {
     char pad1[112];
     struct PPCUserRegStruct pr_reg;
-    reg_t pad2[4];
+    char pad2[40];
 } QEMU_PACKED;
 
 
@@ -211,11 +210,11 @@ static const struct NoteFuncDescStruct {
     int contents_size;
     void (*note_contents_func)(NoteFuncArg *arg, PowerPCCPU *cpu);
 } note_func[] = {
-    {sizeof(((Note *)0)->contents.prstatus),  ppc_write_elf_prstatus},
-    {sizeof(((Note *)0)->contents.fpregset),  ppc_write_elf_fpregset},
-    {sizeof(((Note *)0)->contents.vmxregset), ppc_write_elf_vmxregset},
-    {sizeof(((Note *)0)->contents.vsxregset), ppc_write_elf_vsxregset},
-    {sizeof(((Note *)0)->contents.speregset), ppc_write_elf_speregset},
+    {sizeof_field(Note, contents.prstatus),  ppc_write_elf_prstatus},
+    {sizeof_field(Note, contents.fpregset),  ppc_write_elf_fpregset},
+    {sizeof_field(Note, contents.vmxregset), ppc_write_elf_vmxregset},
+    {sizeof_field(Note, contents.vsxregset), ppc_write_elf_vsxregset},
+    {sizeof_field(Note, contents.speregset), ppc_write_elf_speregset},
     { 0, NULL}
 };
 
@@ -224,8 +223,15 @@ typedef struct NoteFuncDescStruct NoteFuncDesc;
 int cpu_get_dump_info(ArchDumpInfo *info,
                       const struct GuestPhysBlockList *guest_phys_blocks)
 {
-    PowerPCCPU *cpu = POWERPC_CPU(first_cpu);
-    PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cpu);
+    PowerPCCPU *cpu;
+    PowerPCCPUClass *pcc;
+
+    if (first_cpu == NULL) {
+        return -1;
+    }
+
+    cpu = POWERPC_CPU(first_cpu);
+    pcc = POWERPC_CPU_GET_CLASS(cpu);
 
     info->d_machine = PPC_ELF_MACHINE;
     info->d_class = ELFCLASS;

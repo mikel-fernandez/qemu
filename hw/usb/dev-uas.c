@@ -17,9 +17,9 @@
 #include "qemu/error-report.h"
 
 #include "hw/usb.h"
-#include "hw/usb/desc.h"
+#include "desc.h"
 #include "hw/scsi/scsi.h"
-#include "block/scsi.h"
+#include "scsi/constants.h"
 
 /* --------------------------------------------------------------------- */
 
@@ -896,8 +896,6 @@ static void usb_uas_unrealize(USBDevice *dev, Error **errp)
     UASDevice *uas = USB_UAS(dev);
 
     qemu_bh_delete(uas->status_bh);
-
-    object_unref(OBJECT(&uas->bus));
 }
 
 static void usb_uas_realize(USBDevice *dev, Error **errp)

@@ -122,10 +122,22 @@ int qemu_strnlen(const char *s, int max_len);
  * Returns: the pointer originally in @input.
  */
 char *qemu_strsep(char **input, const char *delim);
+#ifdef HAVE_STRCHRNUL
+static inline const char *qemu_strchrnul(const char *s, int c)
+{
+    return strchrnul(s, c);
+}
+#else
+const char *qemu_strchrnul(const char *s, int c);
+#endif
 time_t mktimegm(struct tm *tm);
 int qemu_fdatasync(int fd);
 int fcntl_setfl(int fd, int flag);
 int qemu_parse_fd(const char *param);
+int qemu_strtoi(const char *nptr, const char **endptr, int base,
+                int *result);
+int qemu_strtoui(const char *nptr, const char **endptr, int base,
+                 unsigned int *result);
 int qemu_strtol(const char *nptr, const char **endptr, int base,
                 long *result);
 int qemu_strtoul(const char *nptr, const char **endptr, int base,
@@ -142,13 +154,6 @@ int parse_uint_full(const char *s, unsigned long long *value, int base);
 int qemu_strtosz(const char *nptr, char **end, uint64_t *result);
 int qemu_strtosz_MiB(const char *nptr, char **end, uint64_t *result);
 int qemu_strtosz_metric(const char *nptr, char **end, uint64_t *result);
-
-#define K_BYTE     (1ULL << 10)
-#define M_BYTE     (1ULL << 20)
-#define G_BYTE     (1ULL << 30)
-#define T_BYTE     (1ULL << 40)
-#define P_BYTE     (1ULL << 50)
-#define E_BYTE     (1ULL << 60)
 
 /* used to print char* safely */
 #define STR_OR_NULL(str) ((str) ? (str) : "null")

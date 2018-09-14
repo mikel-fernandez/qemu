@@ -102,6 +102,7 @@ struct USBHostDevice {
     /* callbacks & friends */
     QEMUBH                           *bh_nodev;
     QEMUBH                           *bh_postld;
+    bool                             bh_postld_pending;
     Notifier                         exit;
 
     /* request queues */
@@ -247,7 +248,11 @@ static int usb_host_init(void)
     if (rc != 0) {
         return -1;
     }
+#if LIBUSB_API_VERSION >= 0x01000106
+    libusb_set_option(ctx, LIBUSB_OPTION_LOG_LEVEL, loglevel);
+#else
     libusb_set_debug(ctx, loglevel);
+#endif
 #ifdef CONFIG_WIN32
     /* FIXME: add support for Windows. */
 #else
@@ -866,6 +871,10 @@ static int usb_host_open(USBHostDevice *s, libusb_device *dev)
     int rc;
     Error *local_err = NULL;
 
+    if (s->bh_postld_pending) {
+        return -1;
+    }
+
     trace_usb_host_open_started(bus_num, addr);
 
     if (s->dh != NULL) {
@@ -1107,7 +1116,7 @@ static void usb_host_detach_kernel(USBHostDevice *s)
     if (rc != 0) {
         return;
     }
-    for (i = 0; i < conf->bNumInterfaces; i++) {
+    for (i = 0; i < USB_MAX_INTERFACES; i++) {
         rc = libusb_kernel_driver_active(s->dh, i);
         usb_host_libusb_error("libusb_kernel_driver_active", rc);
         if (rc != 1) {
@@ -1130,7 +1139,7 @@ static void usb_host_attach_kernel(USBHostDevice *s)
     if (rc != 0) {
         return;
     }
-    for (i = 0; i < conf->bNumInterfaces; i++) {
+    for (i = 0; i < USB_MAX_INTERFACES; i++) {
         if (!s->ifs[i].detached) {
             continue;
         }
@@ -1145,7 +1154,7 @@ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
 {
     USBDevice *udev = USB_DEVICE(s);
     struct libusb_config_descriptor *conf;
-    int rc, i;
+    int rc, i, claimed;
 
     for (i = 0; i < USB_MAX_INTERFACES; i++) {
         udev->altsetting[i] = 0;
@@ -1164,14 +1173,19 @@ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
         return USB_RET_STALL;
     }
 
-    for (i = 0; i < conf->bNumInterfaces; i++) {
+    claimed = 0;
+    for (i = 0; i < USB_MAX_INTERFACES; i++) {
         trace_usb_host_claim_interface(s->bus_num, s->addr, configuration, i);
         rc = libusb_claim_interface(s->dh, i);
-        usb_host_libusb_error("libusb_claim_interface", rc);
-        if (rc != 0) {
-            return USB_RET_STALL;
+        if (rc == 0) {
+            s->ifs[i].claimed = true;
+            if (++claimed == conf->bNumInterfaces) {
+                break;
+            }
         }
-        s->ifs[i].claimed = true;
+    }
+    if (claimed != conf->bNumInterfaces) {
+        return USB_RET_STALL;
     }
 
     udev->ninterfaces   = conf->bNumInterfaces;
@@ -1183,10 +1197,9 @@ static int usb_host_claim_interfaces(USBHostDevice *s, int configuration)
 
 static void usb_host_release_interfaces(USBHostDevice *s)
 {
-    USBDevice *udev = USB_DEVICE(s);
     int i, rc;
 
-    for (i = 0; i < udev->ninterfaces; i++) {
+    for (i = 0; i < USB_MAX_INTERFACES; i++) {
         if (!s->ifs[i].claimed) {
             continue;
         }
@@ -1520,6 +1533,7 @@ static void usb_host_post_load_bh(void *opaque)
     if (udev->attached) {
         usb_device_detach(udev);
     }
+    dev->bh_postld_pending = false;
     usb_host_auto_check(NULL);
 }
 
@@ -1531,6 +1545,7 @@ static int usb_host_post_load(void *opaque, int version_id)
         dev->bh_postld = qemu_bh_new(usb_host_post_load_bh, dev);
     }
     qemu_bh_schedule(dev->bh_postld);
+    dev->bh_postld_pending = true;
     return 0;
 }
 

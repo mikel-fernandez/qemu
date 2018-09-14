@@ -21,9 +21,9 @@
 #include "exec/exec-all.h"
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
-
 #include "helper_regs.h"
 #include "exec/cpu_ldst.h"
+#include "tcg.h"
 #include "internal.h"
 
 //#define DEBUG_OP
@@ -111,7 +111,7 @@ void helper_lswx(CPUPPCState *env, target_ulong addr, uint32_t reg,
                  uint32_t ra, uint32_t rb)
 {
     if (likely(xer_bc != 0)) {
-        int num_used_regs = (xer_bc + 3) / 4;
+        int num_used_regs = DIV_ROUND_UP(xer_bc, 4);
         if (unlikely((ra != 0 && lsw_reg_in_range(reg, num_used_regs, ra)) ||
                      lsw_reg_in_range(reg, num_used_regs, rb))) {
             raise_exception_err_ra(env, POWERPC_EXCP_PROGRAM,
@@ -214,6 +214,76 @@ target_ulong helper_lscbx(CPUPPCState *env, target_ulong addr, uint32_t reg,
     }
     return i;
 }
+
+#if defined(TARGET_PPC64) && defined(CONFIG_ATOMIC128)
+uint64_t helper_lq_le_parallel(CPUPPCState *env, target_ulong addr,
+                               uint32_t opidx)
+{
+    Int128 ret = helper_atomic_ldo_le_mmu(env, addr, opidx, GETPC());
+    env->retxh = int128_gethi(ret);
+    return int128_getlo(ret);
+}
+
+uint64_t helper_lq_be_parallel(CPUPPCState *env, target_ulong addr,
+                               uint32_t opidx)
+{
+    Int128 ret = helper_atomic_ldo_be_mmu(env, addr, opidx, GETPC());
+    env->retxh = int128_gethi(ret);
+    return int128_getlo(ret);
+}
+
+void helper_stq_le_parallel(CPUPPCState *env, target_ulong addr,
+                            uint64_t lo, uint64_t hi, uint32_t opidx)
+{
+    Int128 val = int128_make128(lo, hi);
+    helper_atomic_sto_le_mmu(env, addr, val, opidx, GETPC());
+}
+
+void helper_stq_be_parallel(CPUPPCState *env, target_ulong addr,
+                            uint64_t lo, uint64_t hi, uint32_t opidx)
+{
+    Int128 val = int128_make128(lo, hi);
+    helper_atomic_sto_be_mmu(env, addr, val, opidx, GETPC());
+}
+
+uint32_t helper_stqcx_le_parallel(CPUPPCState *env, target_ulong addr,
+                                  uint64_t new_lo, uint64_t new_hi,
+                                  uint32_t opidx)
+{
+    bool success = false;
+
+    if (likely(addr == env->reserve_addr)) {
+        Int128 oldv, cmpv, newv;
+
+        cmpv = int128_make128(env->reserve_val2, env->reserve_val);
+        newv = int128_make128(new_lo, new_hi);
+        oldv = helper_atomic_cmpxchgo_le_mmu(env, addr, cmpv, newv,
+                                             opidx, GETPC());
+        success = int128_eq(oldv, cmpv);
+    }
+    env->reserve_addr = -1;
+    return env->so + success * CRF_EQ_BIT;
+}
+
+uint32_t helper_stqcx_be_parallel(CPUPPCState *env, target_ulong addr,
+                                  uint64_t new_lo, uint64_t new_hi,
+                                  uint32_t opidx)
+{
+    bool success = false;
+
+    if (likely(addr == env->reserve_addr)) {
+        Int128 oldv, cmpv, newv;
+
+        cmpv = int128_make128(env->reserve_val2, env->reserve_val);
+        newv = int128_make128(new_lo, new_hi);
+        oldv = helper_atomic_cmpxchgo_be_mmu(env, addr, cmpv, newv,
+                                             opidx, GETPC());
+        success = int128_eq(oldv, cmpv);
+    }
+    env->reserve_addr = -1;
+    return env->so + success * CRF_EQ_BIT;
+}
+#endif
 
 /*****************************************************************************/
 /* Altivec extension helpers */

@@ -15,6 +15,7 @@
 
 #include "hw/vfio/vfio-common.h"
 #include "hw/hw.h"
+#include "exec/ram_addr.h"
 #include "qemu/error-report.h"
 #include "trace.h"
 
@@ -143,9 +144,28 @@ int vfio_spapr_create_window(VFIOContainer *container,
                              hwaddr *pgsize)
 {
     int ret;
-    unsigned pagesize = memory_region_iommu_get_min_page_size(section->mr);
+    IOMMUMemoryRegion *iommu_mr = IOMMU_MEMORY_REGION(section->mr);
+    uint64_t pagesize = memory_region_iommu_get_min_page_size(iommu_mr);
     unsigned entries, pages;
     struct vfio_iommu_spapr_tce_create create = { .argsz = sizeof(create) };
+    long systempagesize = qemu_getrampagesize();
+
+    /*
+     * The host might not support the guest supported IOMMU page size,
+     * so we will use smaller physical IOMMU pages to back them.
+     */
+    if (pagesize > systempagesize) {
+        pagesize = systempagesize;
+    }
+    pagesize = 1ULL << (63 - clz64(container->pgsizes &
+                                   (pagesize | (pagesize - 1))));
+    if (!pagesize) {
+        error_report("Host doesn't support page size 0x%"PRIx64
+                     ", the supported mask is 0x%lx",
+                     memory_region_iommu_get_min_page_size(iommu_mr),
+                     container->pgsizes);
+        return -EINVAL;
+    }
 
     /*
      * FIXME: For VFIO iommu types which have KVM acceleration to
@@ -162,7 +182,7 @@ int vfio_spapr_create_window(VFIOContainer *container,
      */
     entries = create.window_size >> create.page_shift;
     pages = MAX((entries * sizeof(uint64_t)) / getpagesize(), 1);
-    pages = MAX(pow2ceil(pages) - 1, 1); /* Round up */
+    pages = MAX(pow2ceil(pages), 1); /* Round up */
     create.levels = ctz64(pages) / 6 + 1;
 
     ret = ioctl(container->fd, VFIO_IOMMU_SPAPR_TCE_CREATE, &create);

@@ -52,18 +52,28 @@
 
 #include "qemu/osdep.h"
 #include "libqtest.h"
+#include "qapi/qmp/qdict.h"
 #include "qemu/iov.h"
 #include "qemu/sockets.h"
 #include "qemu/error-report.h"
 #include "qemu/main-loop.h"
 
+/* TODO actually test the results and get rid of this */
+#define qmp_discard_response(...) qobject_unref(qmp(__VA_ARGS__))
+
+static const char *get_devstr(void)
+{
+    if (g_str_equal(qtest_get_arch(), "s390x")) {
+        return "virtio-net-ccw";
+    }
+
+    return "rtl8139";
+}
+
+
 static void test_redirector_tx(void)
 {
-#ifndef _WIN32
-/* socketpair(PF_UNIX) which does not exist on windows */
-
     int backend_sock[2], recv_sock;
-    char *cmdline;
     uint32_t ret = 0, len = 0;
     char send_buf[] = "Hello!!";
     char sock_path0[] = "filter-redirector0.XXXXXX";
@@ -80,20 +90,19 @@ static void test_redirector_tx(void)
     ret = mkstemp(sock_path1);
     g_assert_cmpint(ret, !=, -1);
 
-    cmdline = g_strdup_printf("-netdev socket,id=qtest-bn0,fd=%d "
-                "-device rtl8139,netdev=qtest-bn0,id=qtest-e0 "
-                "-chardev socket,id=redirector0,path=%s,server,nowait "
-                "-chardev socket,id=redirector1,path=%s,server,nowait "
-                "-chardev socket,id=redirector2,path=%s,nowait "
-                "-object filter-redirector,id=qtest-f0,netdev=qtest-bn0,"
-                "queue=tx,outdev=redirector0 "
-                "-object filter-redirector,id=qtest-f1,netdev=qtest-bn0,"
-                "queue=tx,indev=redirector2 "
-                "-object filter-redirector,id=qtest-f2,netdev=qtest-bn0,"
-                "queue=tx,outdev=redirector1 "
-                , backend_sock[1], sock_path0, sock_path1, sock_path0);
-    qtest_start(cmdline);
-    g_free(cmdline);
+    global_qtest = qtest_initf(
+        "-netdev socket,id=qtest-bn0,fd=%d "
+        "-device %s,netdev=qtest-bn0,id=qtest-e0 "
+        "-chardev socket,id=redirector0,path=%s,server,nowait "
+        "-chardev socket,id=redirector1,path=%s,server,nowait "
+        "-chardev socket,id=redirector2,path=%s,nowait "
+        "-object filter-redirector,id=qtest-f0,netdev=qtest-bn0,"
+        "queue=tx,outdev=redirector0 "
+        "-object filter-redirector,id=qtest-f1,netdev=qtest-bn0,"
+        "queue=tx,indev=redirector2 "
+        "-object filter-redirector,id=qtest-f2,netdev=qtest-bn0,"
+        "queue=tx,outdev=redirector1 ", backend_sock[1], get_devstr(),
+        sock_path0, sock_path1, sock_path0);
 
     recv_sock = unix_connect(sock_path1, NULL);
     g_assert_cmpint(recv_sock, !=, -1);
@@ -129,17 +138,11 @@ static void test_redirector_tx(void)
     unlink(sock_path0);
     unlink(sock_path1);
     qtest_end();
-
-#endif
 }
 
 static void test_redirector_rx(void)
 {
-#ifndef _WIN32
-/* socketpair(PF_UNIX) which does not exist on windows */
-
     int backend_sock[2], send_sock;
-    char *cmdline;
     uint32_t ret = 0, len = 0;
     char send_buf[] = "Hello!!";
     char sock_path0[] = "filter-redirector0.XXXXXX";
@@ -156,20 +159,19 @@ static void test_redirector_rx(void)
     ret = mkstemp(sock_path1);
     g_assert_cmpint(ret, !=, -1);
 
-    cmdline = g_strdup_printf("-netdev socket,id=qtest-bn0,fd=%d "
-                "-device rtl8139,netdev=qtest-bn0,id=qtest-e0 "
-                "-chardev socket,id=redirector0,path=%s,server,nowait "
-                "-chardev socket,id=redirector1,path=%s,server,nowait "
-                "-chardev socket,id=redirector2,path=%s,nowait "
-                "-object filter-redirector,id=qtest-f0,netdev=qtest-bn0,"
-                "queue=rx,indev=redirector0 "
-                "-object filter-redirector,id=qtest-f1,netdev=qtest-bn0,"
-                "queue=rx,outdev=redirector2 "
-                "-object filter-redirector,id=qtest-f2,netdev=qtest-bn0,"
-                "queue=rx,indev=redirector1 "
-                , backend_sock[1], sock_path0, sock_path1, sock_path0);
-    qtest_start(cmdline);
-    g_free(cmdline);
+    global_qtest = qtest_initf(
+        "-netdev socket,id=qtest-bn0,fd=%d "
+        "-device %s,netdev=qtest-bn0,id=qtest-e0 "
+        "-chardev socket,id=redirector0,path=%s,server,nowait "
+        "-chardev socket,id=redirector1,path=%s,server,nowait "
+        "-chardev socket,id=redirector2,path=%s,nowait "
+        "-object filter-redirector,id=qtest-f0,netdev=qtest-bn0,"
+        "queue=rx,indev=redirector0 "
+        "-object filter-redirector,id=qtest-f1,netdev=qtest-bn0,"
+        "queue=rx,outdev=redirector2 "
+        "-object filter-redirector,id=qtest-f2,netdev=qtest-bn0,"
+        "queue=rx,indev=redirector1 ", backend_sock[1], get_devstr(),
+        sock_path0, sock_path1, sock_path0);
 
     struct iovec iov[] = {
         {
@@ -188,7 +190,6 @@ static void test_redirector_rx(void)
 
     ret = iov_send(send_sock, iov, 2, 0, sizeof(size) + sizeof(send_buf));
     g_assert_cmpint(ret, ==, sizeof(send_buf) + sizeof(size));
-    close(send_sock);
 
     ret = qemu_recv(backend_sock[0], &len, sizeof(len), 0);
     g_assert_cmpint(ret, ==, sizeof(len));
@@ -199,12 +200,11 @@ static void test_redirector_rx(void)
     ret = qemu_recv(backend_sock[0], recv_buf, len, 0);
     g_assert_cmpstr(recv_buf, ==, send_buf);
 
+    close(send_sock);
     g_free(recv_buf);
     unlink(sock_path0);
     unlink(sock_path1);
     qtest_end();
-
-#endif
 }
 
 int main(int argc, char **argv)

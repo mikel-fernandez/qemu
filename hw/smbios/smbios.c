@@ -16,9 +16,11 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu/config-file.h"
 #include "qemu/error-report.h"
+#include "qemu/option.h"
 #include "sysemu/sysemu.h"
 #include "qemu/uuid.h"
 #include "sysemu/cpus.h"
@@ -94,6 +96,11 @@ static struct {
 static struct {
     const char *sock_pfx, *manufacturer, *version, *serial, *asset, *part;
 } type4;
+
+static struct {
+    size_t nvalues;
+    const char **values;
+} type11;
 
 static struct {
     const char *loc_pfx, *bank, *manufacturer, *serial, *asset, *part;
@@ -280,6 +287,14 @@ static const QemuOptDesc qemu_smbios_type4_opts[] = {
         .help = "part number",
     },
     { /* end of list */ }
+};
+
+static const QemuOptDesc qemu_smbios_type11_opts[] = {
+    {
+        .name = "value",
+        .type = QEMU_OPT_STRING,
+        .help = "OEM string data",
+    },
 };
 
 static const QemuOptDesc qemu_smbios_type17_opts[] = {
@@ -590,9 +605,26 @@ static void smbios_build_type_4_table(unsigned instance)
     smbios_type4_count++;
 }
 
-#define ONE_KB ((ram_addr_t)1 << 10)
-#define ONE_MB ((ram_addr_t)1 << 20)
-#define ONE_GB ((ram_addr_t)1 << 30)
+static void smbios_build_type_11_table(void)
+{
+    char count_str[128];
+    size_t i;
+
+    if (type11.nvalues == 0) {
+        return;
+    }
+
+    SMBIOS_BUILD_TABLE_PRE(11, 0xe00, true); /* required */
+
+    snprintf(count_str, sizeof(count_str), "%zu", type11.nvalues);
+    t->count = type11.nvalues;
+
+    for (i = 0; i < type11.nvalues; i++) {
+        SMBIOS_TABLE_SET_STR_LIST(11, type11.values[i]);
+    }
+
+    SMBIOS_BUILD_TABLE_POST;
+}
 
 #define MAX_T16_STD_SZ 0x80000000 /* 2T in Kilobytes */
 
@@ -605,7 +637,7 @@ static void smbios_build_type_16_table(unsigned dimm_cnt)
     t->location = 0x01; /* Other */
     t->use = 0x03; /* System memory */
     t->error_correction = 0x06; /* Multi-bit ECC (for Microsoft, per SeaBIOS) */
-    size_kb = QEMU_ALIGN_UP(ram_size, ONE_KB) / ONE_KB;
+    size_kb = QEMU_ALIGN_UP(ram_size, KiB) / KiB;
     if (size_kb < MAX_T16_STD_SZ) {
         t->maximum_capacity = cpu_to_le32(size_kb);
         t->extended_maximum_capacity = cpu_to_le64(0);
@@ -633,7 +665,7 @@ static void smbios_build_type_17_table(unsigned instance, uint64_t size)
     t->memory_error_information_handle = cpu_to_le16(0xFFFE); /* Not provided */
     t->total_width = cpu_to_le16(0xFFFF); /* Unknown */
     t->data_width = cpu_to_le16(0xFFFF); /* Unknown */
-    size_mb = QEMU_ALIGN_UP(size, ONE_MB) / ONE_MB;
+    size_mb = QEMU_ALIGN_UP(size, MiB) / MiB;
     if (size_mb < MAX_T17_STD_SZ) {
         t->size = cpu_to_le16(size_mb);
         t->extended_size = cpu_to_le32(0);
@@ -672,8 +704,8 @@ static void smbios_build_type_19_table(unsigned instance,
 
     end = start + size - 1;
     assert(end > start);
-    start_kb = start / ONE_KB;
-    end_kb = end / ONE_KB;
+    start_kb = start / KiB;
+    end_kb = end / KiB;
     if (start_kb < UINT32_MAX && end_kb < UINT32_MAX) {
         t->starting_address = cpu_to_le32(start_kb);
         t->ending_address = cpu_to_le32(end_kb);
@@ -832,7 +864,9 @@ void smbios_get_tables(const struct smbios_phys_mem_area *mem_array,
             smbios_build_type_4_table(i);
         }
 
-#define MAX_DIMM_SZ (16ll * ONE_GB)
+        smbios_build_type_11_table();
+
+#define MAX_DIMM_SZ (16 * GiB)
 #define GET_DIMM_SZ ((i < dimm_cnt - 1) ? MAX_DIMM_SZ \
                                         : ((ram_size - 1) % MAX_DIMM_SZ) + 1)
 
@@ -880,6 +914,38 @@ static void save_opt(const char **dest, QemuOpts *opts, const char *name)
     if (val) {
         *dest = val;
     }
+}
+
+
+struct opt_list {
+    const char *name;
+    size_t *ndest;
+    const char ***dest;
+};
+
+static int save_opt_one(void *opaque,
+                        const char *name, const char *value,
+                        Error **errp)
+{
+    struct opt_list *opt = opaque;
+
+    if (!g_str_equal(name, opt->name)) {
+        return 0;
+    }
+
+    *opt->dest = g_renew(const char *, *opt->dest, (*opt->ndest) + 1);
+    (*opt->dest)[*opt->ndest] = value;
+    (*opt->ndest)++;
+    return 0;
+}
+
+static void save_opt_list(size_t *ndest, const char ***dest,
+                          QemuOpts *opts, const char *name)
+{
+    struct opt_list opt = {
+        name, ndest, dest,
+    };
+    qemu_opt_foreach(opts, save_opt_one, &opt, NULL);
 }
 
 void smbios_entry_add(QemuOpts *opts, Error **errp)
@@ -1034,6 +1100,10 @@ void smbios_entry_add(QemuOpts *opts, Error **errp)
             save_opt(&type4.serial, opts, "serial");
             save_opt(&type4.asset, opts, "asset");
             save_opt(&type4.part, opts, "part");
+            return;
+        case 11:
+            qemu_opts_validate(opts, qemu_smbios_type11_opts, &error_fatal);
+            save_opt_list(&type11.nvalues, &type11.values, opts, "value");
             return;
         case 17:
             qemu_opts_validate(opts, qemu_smbios_type17_opts, &error_fatal);

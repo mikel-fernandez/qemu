@@ -392,11 +392,11 @@ static void data_test_init(e1000e_device *d)
     qtest_start(cmdline);
     g_free(cmdline);
 
-    test_bus = qpci_init_pc(NULL);
-    g_assert_nonnull(test_bus);
-
-    test_alloc = pc_alloc_init();
+    test_alloc = pc_alloc_init(global_qtest);
     g_assert_nonnull(test_alloc);
+
+    test_bus = qpci_init_pc(global_qtest, test_alloc);
+    g_assert_nonnull(test_bus);
 
     e1000e_device_init(test_bus, d);
 }
@@ -456,12 +456,10 @@ static void test_e1000e_multiple_transfers(gconstpointer data)
 
 static void test_e1000e_hotplug(gconstpointer data)
 {
-    static const uint8_t slot = 0x06;
-
     qtest_start("-device e1000e");
 
-    qpci_plug_device_test("e1000e", "e1000e_net", slot, NULL);
-    qpci_unplug_acpi_device_test("e1000e_net", slot);
+    qtest_qmp_device_add("e1000e", "e1000e_net", "{'addr': '0x06'}");
+    qpci_unplug_acpi_device_test("e1000e_net", 0x06);
 
     qtest_end();
 }

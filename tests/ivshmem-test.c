@@ -131,6 +131,7 @@ static void setup_vm_cmd(IVState *s, const char *cmd, bool msix)
         g_printerr("ivshmem-test tests are only available on x86 or ppc64\n");
         exit(EXIT_FAILURE);
     }
+    global_qtest = s->qs->qts;
     s->dev = get_device(s->qs->pcibus);
 
     s->reg_bar = qpci_iomap(s->dev, 0, &barsize);
@@ -419,19 +420,17 @@ static void test_ivshmem_server_irq(void)
 static void test_ivshmem_hotplug(void)
 {
     const char *arch = qtest_get_arch();
-    gchar *opts;
 
     qtest_start("");
 
-    opts = g_strdup_printf("'shm': '%s', 'size': '1M'", tmpshm);
-
-    qpci_plug_device_test("ivshmem", "iv1", PCI_SLOT_HP, opts);
+    qtest_qmp_device_add("ivshmem",
+                         "iv1", "{'addr': %s, 'shm': %s, 'size': '1M'}",
+                         stringify(PCI_SLOT_HP), tmpshm);
     if (strcmp(arch, "ppc64") != 0) {
         qpci_unplug_acpi_device_test("iv1", PCI_SLOT_HP);
     }
 
     qtest_end();
-    g_free(opts);
 }
 
 static void test_ivshmem_memdev(void)
@@ -502,12 +501,6 @@ int main(int argc, char **argv)
     int ret, fd;
     const char *arch = qtest_get_arch();
     gchar dir[] = "/tmp/ivshmem-test.XXXXXX";
-
-#if !GLIB_CHECK_VERSION(2, 31, 0)
-    if (!g_thread_supported()) {
-        g_thread_init(NULL);
-    }
-#endif
 
     g_test_init(&argc, &argv, NULL);
 

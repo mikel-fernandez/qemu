@@ -19,10 +19,10 @@
 #include "qemu/osdep.h"
 #include "cpu.h"
 #include "internal.h"
-#include "exec/exec-all.h"
 #include "qemu/host-utils.h"
 #include "exec/helper-proto.h"
 #include "crypto/aes.h"
+#include "fpu/softfloat.h"
 
 #include "helper_regs.h"
 /*****************************************************************************/
@@ -183,7 +183,7 @@ uint64_t helper_bpermd(uint64_t rs, uint64_t rb)
     for (i = 0; i < 8; i++) {
         int index = (rs >> (i*8)) & 0xFF;
         if (index < 64) {
-            if (rb & (1ull << (63-index))) {
+            if (rb & PPC_BIT(index)) {
                 ra |= 1 << i;
             }
         }
@@ -219,17 +219,17 @@ target_ulong helper_sraw(CPUPPCState *env, target_ulong value,
             shift &= 0x1f;
             ret = (int32_t)value >> shift;
             if (likely(ret >= 0 || (value & ((1 << shift) - 1)) == 0)) {
-                env->ca = 0;
+                env->ca32 = env->ca = 0;
             } else {
-                env->ca = 1;
+                env->ca32 = env->ca = 1;
             }
         } else {
             ret = (int32_t)value;
-            env->ca = 0;
+            env->ca32 = env->ca = 0;
         }
     } else {
         ret = (int32_t)value >> 31;
-        env->ca = (ret != 0);
+        env->ca32 = env->ca = (ret != 0);
     }
     return (target_long)ret;
 }
@@ -245,17 +245,17 @@ target_ulong helper_srad(CPUPPCState *env, target_ulong value,
             shift &= 0x3f;
             ret = (int64_t)value >> shift;
             if (likely(ret >= 0 || (value & ((1ULL << shift) - 1)) == 0)) {
-                env->ca = 0;
+                env->ca32 = env->ca = 0;
             } else {
-                env->ca = 1;
+                env->ca32 = env->ca = 1;
             }
         } else {
             ret = (int64_t)value;
-            env->ca = 0;
+            env->ca32 = env->ca = 0;
         }
     } else {
         ret = (int64_t)value >> 63;
-        env->ca = (ret != 0);
+        env->ca32 = env->ca = (ret != 0);
     }
     return ret;
 }
@@ -378,7 +378,7 @@ target_ulong helper_divso(CPUPPCState *env, target_ulong arg1,
 target_ulong helper_602_mfrom(target_ulong arg)
 {
     if (likely(arg < 602)) {
-#include "mfrom_table.c"
+#include "mfrom_table.inc.c"
         return mfrom_ROM_table[arg];
     } else {
         return 0;
@@ -1951,7 +1951,7 @@ VSPLT(w, u32)
 #define VINSERT(suffix, element)                                            \
     void helper_vinsert##suffix(ppc_avr_t *r, ppc_avr_t *b, uint32_t index) \
     {                                                                       \
-        memmove(&r->u8[index], &b->u8[8 - sizeof(r->element)],              \
+        memmove(&r->u8[index], &b->u8[8 - sizeof(r->element[0])],           \
                sizeof(r->element[0]));                                      \
     }
 #else
@@ -2671,16 +2671,14 @@ static int bcd_cmp_mag(ppc_avr_t *a, ppc_avr_t *b)
     return 0;
 }
 
-static int bcd_add_mag(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b, int *invalid,
+static void bcd_add_mag(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b, int *invalid,
                        int *overflow)
 {
     int carry = 0;
     int i;
-    int is_zero = 1;
     for (i = 1; i <= 31; i++) {
         uint8_t digit = bcd_get_digit(a, i, invalid) +
                         bcd_get_digit(b, i, invalid) + carry;
-        is_zero &= (digit == 0);
         if (digit > 9) {
             carry = 1;
             digit -= 10;
@@ -2689,26 +2687,20 @@ static int bcd_add_mag(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b, int *invalid,
         }
 
         bcd_put_digit(t, digit, i);
-
-        if (unlikely(*invalid)) {
-            return -1;
-        }
     }
 
     *overflow = carry;
-    return is_zero;
 }
 
-static int bcd_sub_mag(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b, int *invalid,
+static void bcd_sub_mag(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b, int *invalid,
                        int *overflow)
 {
     int carry = 0;
     int i;
-    int is_zero = 1;
+
     for (i = 1; i <= 31; i++) {
         uint8_t digit = bcd_get_digit(a, i, invalid) -
                         bcd_get_digit(b, i, invalid) + carry;
-        is_zero &= (digit == 0);
         if (digit & 0x80) {
             carry = -1;
             digit += 10;
@@ -2717,14 +2709,9 @@ static int bcd_sub_mag(ppc_avr_t *t, ppc_avr_t *a, ppc_avr_t *b, int *invalid,
         }
 
         bcd_put_digit(t, digit, i);
-
-        if (unlikely(*invalid)) {
-            return -1;
-        }
     }
 
     *overflow = carry;
-    return is_zero;
 }
 
 uint32_t helper_bcdadd(ppc_avr_t *r,  ppc_avr_t *a, ppc_avr_t *b, uint32_t ps)
@@ -2734,23 +2721,28 @@ uint32_t helper_bcdadd(ppc_avr_t *r,  ppc_avr_t *a, ppc_avr_t *b, uint32_t ps)
     int sgnb = bcd_get_sgn(b);
     int invalid = (sgna == 0) || (sgnb == 0);
     int overflow = 0;
-    int zero = 0;
     uint32_t cr = 0;
     ppc_avr_t result = { .u64 = { 0, 0 } };
 
     if (!invalid) {
         if (sgna == sgnb) {
             result.u8[BCD_DIG_BYTE(0)] = bcd_preferred_sgn(sgna, ps);
-            zero = bcd_add_mag(&result, a, b, &invalid, &overflow);
-            cr = (sgna > 0) ? CRF_GT : CRF_LT;
-        } else if (bcd_cmp_mag(a, b) > 0) {
-            result.u8[BCD_DIG_BYTE(0)] = bcd_preferred_sgn(sgna, ps);
-            zero = bcd_sub_mag(&result, a, b, &invalid, &overflow);
-            cr = (sgna > 0) ? CRF_GT : CRF_LT;
+            bcd_add_mag(&result, a, b, &invalid, &overflow);
+            cr = bcd_cmp_zero(&result);
         } else {
-            result.u8[BCD_DIG_BYTE(0)] = bcd_preferred_sgn(sgnb, ps);
-            zero = bcd_sub_mag(&result, b, a, &invalid, &overflow);
-            cr = (sgnb > 0) ? CRF_GT : CRF_LT;
+            int magnitude = bcd_cmp_mag(a, b);
+            if (magnitude > 0) {
+                result.u8[BCD_DIG_BYTE(0)] = bcd_preferred_sgn(sgna, ps);
+                bcd_sub_mag(&result, a, b, &invalid, &overflow);
+                cr = (sgna > 0) ? CRF_GT : CRF_LT;
+            } else if (magnitude < 0) {
+                result.u8[BCD_DIG_BYTE(0)] = bcd_preferred_sgn(sgnb, ps);
+                bcd_sub_mag(&result, b, a, &invalid, &overflow);
+                cr = (sgnb > 0) ? CRF_GT : CRF_LT;
+            } else {
+                result.u8[BCD_DIG_BYTE(0)] = bcd_preferred_sgn(0, ps);
+                cr = CRF_EQ;
+            }
         }
     }
 
@@ -2759,8 +2751,6 @@ uint32_t helper_bcdadd(ppc_avr_t *r,  ppc_avr_t *a, ppc_avr_t *b, uint32_t ps)
         cr = CRF_SO;
     } else if (overflow) {
         cr |= CRF_SO;
-    } else if (zero) {
-        cr = CRF_EQ;
     }
 
     *r = result;

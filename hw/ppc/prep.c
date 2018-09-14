@@ -41,15 +41,16 @@
 #include "hw/ide.h"
 #include "hw/loader.h"
 #include "hw/timer/mc146818rtc.h"
+#include "hw/input/i8042.h"
 #include "hw/isa/pc87312.h"
-#include "sysemu/block-backend.h"
+#include "hw/net/ne2000-isa.h"
 #include "sysemu/arch_init.h"
 #include "sysemu/kvm.h"
 #include "sysemu/qtest.h"
 #include "exec/address-spaces.h"
 #include "trace.h"
 #include "elf.h"
-#include "qemu/cutils.h"
+#include "qemu/units.h"
 #include "kvm_ppc.h"
 
 /* SMP is not enabled, for now */
@@ -59,7 +60,7 @@
 
 #define CFG_ADDR 0xf0000510
 
-#define BIOS_SIZE (1024 * 1024)
+#define BIOS_SIZE (1 * MiB)
 #define BIOS_FILENAME "ppc_rom.bin"
 #define KERNEL_LOAD_ADDR 0x01000000
 #define INITRD_LOAD_ADDR 0x01800000
@@ -76,94 +77,6 @@ static int ne2000_irq[NE2000_NB_MAX] = { 9, 10, 11, 3, 4, 5 };
 
 /* ISA IO ports bridge */
 #define PPC_IO_BASE 0x80000000
-
-/* PowerPC control and status registers */
-#if 0 // Not used
-static struct {
-    /* IDs */
-    uint32_t veni_devi;
-    uint32_t revi;
-    /* Control and status */
-    uint32_t gcsr;
-    uint32_t xcfr;
-    uint32_t ct32;
-    uint32_t mcsr;
-    /* General purpose registers */
-    uint32_t gprg[6];
-    /* Exceptions */
-    uint32_t feen;
-    uint32_t fest;
-    uint32_t fema;
-    uint32_t fecl;
-    uint32_t eeen;
-    uint32_t eest;
-    uint32_t eecl;
-    uint32_t eeint;
-    uint32_t eemck0;
-    uint32_t eemck1;
-    /* Error diagnostic */
-} XCSR;
-
-static void PPC_XCSR_writeb (void *opaque,
-                             hwaddr addr, uint32_t value)
-{
-    printf("%s: 0x" TARGET_FMT_plx " => 0x%08" PRIx32 "\n", __func__, addr,
-           value);
-}
-
-static void PPC_XCSR_writew (void *opaque,
-                             hwaddr addr, uint32_t value)
-{
-    printf("%s: 0x" TARGET_FMT_plx " => 0x%08" PRIx32 "\n", __func__, addr,
-           value);
-}
-
-static void PPC_XCSR_writel (void *opaque,
-                             hwaddr addr, uint32_t value)
-{
-    printf("%s: 0x" TARGET_FMT_plx " => 0x%08" PRIx32 "\n", __func__, addr,
-           value);
-}
-
-static uint32_t PPC_XCSR_readb (void *opaque, hwaddr addr)
-{
-    uint32_t retval = 0;
-
-    printf("%s: 0x" TARGET_FMT_plx " <= %08" PRIx32 "\n", __func__, addr,
-           retval);
-
-    return retval;
-}
-
-static uint32_t PPC_XCSR_readw (void *opaque, hwaddr addr)
-{
-    uint32_t retval = 0;
-
-    printf("%s: 0x" TARGET_FMT_plx " <= %08" PRIx32 "\n", __func__, addr,
-           retval);
-
-    return retval;
-}
-
-static uint32_t PPC_XCSR_readl (void *opaque, hwaddr addr)
-{
-    uint32_t retval = 0;
-
-    printf("%s: 0x" TARGET_FMT_plx " <= %08" PRIx32 "\n", __func__, addr,
-           retval);
-
-    return retval;
-}
-
-static const MemoryRegionOps PPC_XCSR_ops = {
-    .old_mmio = {
-        .read = { PPC_XCSR_readb, PPC_XCSR_readw, PPC_XCSR_readl, },
-        .write = { PPC_XCSR_writeb, PPC_XCSR_writew, PPC_XCSR_writel, },
-    },
-    .endianness = DEVICE_LITTLE_ENDIAN,
-};
-
-#endif
 
 /* Fake super-io ports for PREP platform (Intel 82378ZB) */
 typedef struct sysctrl_t {
@@ -517,14 +430,8 @@ static void ppc_prep_init(MachineState *machine)
     linux_boot = (kernel_filename != NULL);
 
     /* init CPUs */
-    if (machine->cpu_model == NULL)
-        machine->cpu_model = "602";
     for (i = 0; i < smp_cpus; i++) {
-        cpu = cpu_ppc_init(machine->cpu_model);
-        if (cpu == NULL) {
-            fprintf(stderr, "Unable to find PowerPC CPU definition\n");
-            exit(1);
-        }
+        cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
         env = &cpu->env;
 
         if (env->flags & POWERPC_FLAG_RTC_CLK) {
@@ -579,7 +486,7 @@ static void ppc_prep_init(MachineState *machine)
             }
         }
         if (ppc_boot_device == '\0') {
-            fprintf(stderr, "No valid boot device for Mac99 machine\n");
+            error_report("No valid boot device for Mac99 machine");
             exit(1);
         }
     }
@@ -600,7 +507,7 @@ static void ppc_prep_init(MachineState *machine)
     qdev_init_nofail(dev);
     pci_bus = (PCIBus *)qdev_get_child_bus(dev, "pci.0");
     if (pci_bus == NULL) {
-        fprintf(stderr, "Couldn't create PCI host controller.\n");
+        error_report("Couldn't create PCI host controller");
         exit(1);
     }
     sysctrl->contiguous_map_irq = qdev_get_gpio_in(dev, 0);
@@ -617,7 +524,7 @@ static void ppc_prep_init(MachineState *machine)
     isa_bus = ISA_BUS(qdev_get_child_bus(DEVICE(pci), "isa.0"));
 
     /* Super I/O (parallel + serial ports) */
-    isa = isa_create(isa_bus, TYPE_PC87312);
+    isa = isa_create(isa_bus, TYPE_PC87312_SUPERIO);
     dev = DEVICE(isa);
     qdev_prop_set_uint8(dev, "config", 13); /* fdc, ser0, ser1, par0 */
     qdev_init_nofail(dev);
@@ -646,7 +553,6 @@ static void ppc_prep_init(MachineState *machine)
                      hd[2 * i],
 		     hd[2 * i + 1]);
     }
-    isa_create_simple(isa_bus, "i8042");
 
     cpu = POWERPC_CPU(first_cpu);
     sysctrl->reset_irq = cpu->env.irq_inputs[PPC6xx_INPUT_HRESET];
@@ -654,11 +560,10 @@ static void ppc_prep_init(MachineState *machine)
     portio_list_init(&prep_port_list, NULL, prep_portio_list, sysctrl, "prep");
     portio_list_add(&prep_port_list, isa_address_space_io(isa), 0x0);
 
-    /* PowerPC control and status register group */
-#if 0
-    memory_region_init_io(xcsr, NULL, &PPC_XCSR_ops, NULL, "ppc-xcsr", 0x1000);
-    memory_region_add_subregion(sysmem, 0xFEFF0000, xcsr);
-#endif
+    /*
+     * PowerPC control and status register group: unimplemented,
+     * would be at address 0xFEFF0000.
+     */
 
     if (machine_usb(machine)) {
         pci_create_simple(pci_bus, -1, "pci-ohci");
@@ -682,11 +587,14 @@ static void ppc_prep_init(MachineState *machine)
 
 static void prep_machine_init(MachineClass *mc)
 {
+    mc->deprecation_reason = "use 40p machine type instead";
     mc->desc = "PowerPC PREP platform";
     mc->init = ppc_prep_init;
     mc->block_default_type = IF_IDE;
     mc->max_cpus = MAX_CPUS;
     mc->default_boot_order = "cad";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("602");
+    mc->default_display = "std";
 }
 
 static int prep_set_cmos_checksum(DeviceState *dev, void *opaque)
@@ -700,6 +608,9 @@ static int prep_set_cmos_checksum(DeviceState *dev, void *opaque)
         rtc_set_memory(rtc, 0x3e, checksum & 0xff);
         rtc_set_memory(rtc, 0x2f, checksum >> 8);
         rtc_set_memory(rtc, 0x3f, checksum >> 8);
+
+        object_property_add_alias(qdev_get_machine(), "rtc-time", OBJECT(rtc),
+                                  "date", NULL);
     }
     return 0;
 }
@@ -710,7 +621,7 @@ static void ibm_40p_init(MachineState *machine)
     uint16_t cmos_checksum;
     PowerPCCPU *cpu;
     DeviceState *dev;
-    SysBusDevice *pcihost;
+    SysBusDevice *pcihost, *s;
     Nvram *m48t59 = NULL;
     PCIBus *pci_bus;
     ISABus *isa_bus;
@@ -721,15 +632,7 @@ static void ibm_40p_init(MachineState *machine)
     char boot_device;
 
     /* init CPU */
-    if (!machine->cpu_model) {
-        machine->cpu_model = "604";
-    }
-    cpu = cpu_ppc_init(machine->cpu_model);
-    if (!cpu) {
-        error_report("could not initialize CPU '%s'",
-                     machine->cpu_model);
-        exit(1);
-    }
+    cpu = POWERPC_CPU(cpu_create(machine->cpu_type));
     env = &cpu->env;
     if (PPC_INPUT(env) != PPC_FLAGS_INPUT_6xx) {
         error_report("only 6xx bus is supported on this machine");
@@ -781,12 +684,8 @@ static void ibm_40p_init(MachineState *machine)
     qbus_walk_children(BUS(isa_bus), prep_set_cmos_checksum, NULL, NULL, NULL,
                        &cmos_checksum);
 
-    /* initialize audio subsystem */
-    audio_init();
-
     /* add some more devices */
     if (defaults_enabled()) {
-        isa_create_simple(isa_bus, "i8042");
         m48t59 = NVRAM(isa_create_simple(isa_bus, "isa-m48t59"));
 
         dev = DEVICE(isa_create(isa_bus, "cs4231a"));
@@ -803,7 +702,7 @@ static void ibm_40p_init(MachineState *machine)
         qdev_prop_set_uint32(dev, "equipment", 0xc0);
         qdev_init_nofail(dev);
 
-        pci_create_simple(pci_bus, PCI_DEVFN(1, 0), "lsi53c810");
+        lsi53c810_create(pci_bus, PCI_DEVFN(1, 0));
 
         /* XXX: s3-trio at PCI_DEVFN(2, 0) */
         pci_vga_init(pci_bus);
@@ -815,7 +714,16 @@ static void ibm_40p_init(MachineState *machine)
     }
 
     /* Prepare firmware configuration for OpenBIOS */
-    fw_cfg = fw_cfg_init_mem(CFG_ADDR, CFG_ADDR + 2);
+    dev = qdev_create(NULL, TYPE_FW_CFG_MEM);
+    fw_cfg = FW_CFG(dev);
+    qdev_prop_set_uint32(dev, "data_width", 1);
+    qdev_prop_set_bit(dev, "dma_enabled", false);
+    object_property_add_child(OBJECT(qdev_get_machine()), TYPE_FW_CFG,
+                              OBJECT(fw_cfg), NULL);
+    qdev_init_nofail(dev);
+    s = SYS_BUS_DEVICE(dev);
+    sysbus_mmio_map(s, 0, CFG_ADDR);
+    sysbus_mmio_map(s, 1, CFG_ADDR + 2);
 
     if (machine->kernel_filename) {
         /* load kernel */
@@ -901,10 +809,11 @@ static void ibm_40p_machine_init(MachineClass *mc)
     mc->desc = "IBM RS/6000 7020 (40p)",
     mc->init = ibm_40p_init;
     mc->max_cpus = 1;
-    mc->pci_allow_0_address = true;
-    mc->default_ram_size = 128 * M_BYTE;
+    mc->default_ram_size = 128 * MiB;
     mc->block_default_type = IF_SCSI;
     mc->default_boot_order = "c";
+    mc->default_cpu_type = POWERPC_CPU_TYPE_NAME("604");
+    mc->default_display = "std";
 }
 
 DEFINE_MACHINE("40p", ibm_40p_machine_init)

@@ -27,7 +27,9 @@
 #include "hw/boards.h"
 #include "sysemu/block-backend.h"
 #include "sysemu/blockdev.h"
+#include "qapi/qmp/qdict.h"
 #include "qemu/config-file.h"
+#include "qemu/option.h"
 #include "sysemu/sysemu.h"
 #include "monitor/monitor.h"
 #include "block/block_int.h"
@@ -65,10 +67,6 @@ void hmp_drive_add(Monitor *mon, const QDict *qdict)
 
     dinfo = add_init_drive(opts);
     if (!dinfo) {
-        goto err;
-    }
-    if (dinfo->devaddr) {
-        monitor_printf(mon, "Parameter addr not supported\n");
         goto err;
     }
 

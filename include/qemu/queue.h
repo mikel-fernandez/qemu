@@ -324,6 +324,14 @@ struct {                                                                \
     }                                                                   \
 } while (/*CONSTCOND*/0)
 
+#define QSIMPLEQ_PREPEND(head1, head2) do {                             \
+    if (!QSIMPLEQ_EMPTY((head2))) {                                     \
+        *(head2)->sqh_last = (head1)->sqh_first;                        \
+        (head1)->sqh_first = (head2)->sqh_first;                          \
+        QSIMPLEQ_INIT((head2));                                         \
+    }                                                                   \
+} while (/*CONSTCOND*/0)
+
 #define QSIMPLEQ_LAST(head, type, field)                                \
     (QSIMPLEQ_EMPTY((head)) ?                                           \
         NULL :                                                          \
@@ -333,6 +341,7 @@ struct {                                                                \
 /*
  * Simple queue access methods.
  */
+#define QSIMPLEQ_EMPTY_ATOMIC(head) (atomic_read(&((head)->sqh_first)) == NULL)
 #define QSIMPLEQ_EMPTY(head)        ((head)->sqh_first == NULL)
 #define QSIMPLEQ_FIRST(head)        ((head)->sqh_first)
 #define QSIMPLEQ_NEXT(elm, field)   ((elm)->field.sqe_next)
@@ -424,6 +433,11 @@ struct {                                                                \
         for ((var) = (*(((struct headname *)((head)->tqh_last))->tqh_last));    \
                 (var);                                                  \
                 (var) = (*(((struct headname *)((var)->field.tqe_prev))->tqh_last)))
+
+#define QTAILQ_FOREACH_REVERSE_SAFE(var, head, headname, field, prev_var) \
+        for ((var) = (*(((struct headname *)((head)->tqh_last))->tqh_last)); \
+             (var) && ((prev_var) = (*(((struct headname *)((var)->field.tqe_prev))->tqh_last)), 1); \
+             (var) = (prev_var))
 
 /*
  * Tail queue access methods.

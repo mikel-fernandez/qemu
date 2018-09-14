@@ -23,14 +23,18 @@
 static inline void cpu_clone_regs(CPUOpenRISCState *env, target_ulong newsp)
 {
     if (newsp) {
-        env->gpr[1] = newsp;
+        cpu_set_gpr(env, 1, newsp);
     }
-    env->gpr[11] = 0;
+    cpu_set_gpr(env, 11, 0);
 }
 
 static inline void cpu_set_tls(CPUOpenRISCState *env, target_ulong newtls)
 {
-    env->gpr[10] = newtls;
+    cpu_set_gpr(env, 10, newtls);
 }
 
+static inline abi_ulong get_sp_from_cpustate(CPUOpenRISCState *state)
+{
+    return cpu_get_gpr(state, 1);
+}
 #endif

@@ -21,19 +21,24 @@
 #include "qapi/error.h"
 #include "cpu.h"
 #include "qemu-common.h"
-#include "exec/exec-all.h"
 
 static void openrisc_cpu_set_pc(CPUState *cs, vaddr value)
 {
     OpenRISCCPU *cpu = OPENRISC_CPU(cs);
 
     cpu->env.pc = value;
+    cpu->env.dflag = 0;
 }
 
 static bool openrisc_cpu_has_work(CPUState *cs)
 {
     return cs->interrupt_request & (CPU_INTERRUPT_HARD |
                                     CPU_INTERRUPT_TIMER);
+}
+
+static void openrisc_disas_set_info(CPUState *cpu, disassemble_info *info)
+{
+    info->print_insn = print_insn_or1k;
 }
 
 /* CPUClass::reset() */
@@ -51,24 +56,19 @@ static void openrisc_cpu_reset(CPUState *s)
     cpu->env.lock_addr = -1;
     s->exception_index = -1;
 
-    cpu->env.upr = UPR_UP | UPR_DMP | UPR_IMP | UPR_PICP | UPR_TTP;
-    cpu->env.cpucfgr = CPUCFGR_OB32S | CPUCFGR_OF32S;
-    cpu->env.dmmucfgr = (DMMUCFGR_NTW & (0 << 2)) | (DMMUCFGR_NTS & (6 << 2));
-    cpu->env.immucfgr = (IMMUCFGR_NTW & (0 << 2)) | (IMMUCFGR_NTS & (6 << 2));
+    cpu->env.upr = UPR_UP | UPR_DMP | UPR_IMP | UPR_PICP | UPR_TTP |
+                   UPR_PMP;
+    cpu->env.dmmucfgr = (DMMUCFGR_NTW & (0 << 2))
+                      | (DMMUCFGR_NTS & (ctz32(TLB_SIZE) << 2));
+    cpu->env.immucfgr = (IMMUCFGR_NTW & (0 << 2))
+                      | (IMMUCFGR_NTS & (ctz32(TLB_SIZE) << 2));
 
 #ifndef CONFIG_USER_ONLY
     cpu->env.picmr = 0x00000000;
     cpu->env.picsr = 0x00000000;
 
     cpu->env.ttmr = 0x00000000;
-    cpu->env.ttcr = 0x00000000;
 #endif
-}
-
-static inline void set_feature(OpenRISCCPU *cpu, int feature)
-{
-    cpu->feature |= feature;
-    cpu->env.cpucfgr = cpu->feature;
 }
 
 static void openrisc_cpu_realizefn(DeviceState *dev, Error **errp)
@@ -93,18 +93,8 @@ static void openrisc_cpu_initfn(Object *obj)
 {
     CPUState *cs = CPU(obj);
     OpenRISCCPU *cpu = OPENRISC_CPU(obj);
-    static int inited;
 
     cs->env_ptr = &cpu->env;
-
-#ifndef CONFIG_USER_ONLY
-    cpu_openrisc_mmu_init(cpu);
-#endif
-
-    if (tcg_enabled() && !inited) {
-        inited = 1;
-        openrisc_translate_init();
-    }
 }
 
 /* CPU models */
@@ -114,11 +104,7 @@ static ObjectClass *openrisc_cpu_class_by_name(const char *cpu_model)
     ObjectClass *oc;
     char *typename;
 
-    if (cpu_model == NULL) {
-        return NULL;
-    }
-
-    typename = g_strdup_printf("%s-" TYPE_OPENRISC_CPU, cpu_model);
+    typename = g_strdup_printf(OPENRISC_CPU_TYPE_NAME("%s"), cpu_model);
     oc = object_class_by_name(typename);
     g_free(typename);
     if (oc != NULL && (!object_class_dynamic_cast(oc, TYPE_OPENRISC_CPU) ||
@@ -132,26 +118,16 @@ static void or1200_initfn(Object *obj)
 {
     OpenRISCCPU *cpu = OPENRISC_CPU(obj);
 
-    set_feature(cpu, OPENRISC_FEATURE_OB32S);
-    set_feature(cpu, OPENRISC_FEATURE_OF32S);
+    cpu->env.cpucfgr = CPUCFGR_NSGF | CPUCFGR_OB32S | CPUCFGR_OF32S |
+                       CPUCFGR_EVBARP;
 }
 
 static void openrisc_any_initfn(Object *obj)
 {
     OpenRISCCPU *cpu = OPENRISC_CPU(obj);
 
-    set_feature(cpu, OPENRISC_FEATURE_OB32S);
+    cpu->env.cpucfgr = CPUCFGR_NSGF | CPUCFGR_OB32S | CPUCFGR_EVBARP;
 }
-
-typedef struct OpenRISCCPUInfo {
-    const char *name;
-    void (*initfn)(Object *obj);
-} OpenRISCCPUInfo;
-
-static const OpenRISCCPUInfo openrisc_cpus[] = {
-    { .name = "or1200",      .initfn = or1200_initfn },
-    { .name = "any",         .initfn = openrisc_any_initfn },
-};
 
 static void openrisc_cpu_class_init(ObjectClass *oc, void *data)
 {
@@ -159,9 +135,8 @@ static void openrisc_cpu_class_init(ObjectClass *oc, void *data)
     CPUClass *cc = CPU_CLASS(occ);
     DeviceClass *dc = DEVICE_CLASS(oc);
 
-    occ->parent_realize = dc->realize;
-    dc->realize = openrisc_cpu_realizefn;
-
+    device_class_set_parent_realize(dc, openrisc_cpu_realizefn,
+                                    &occ->parent_realize);
     occ->parent_reset = cc->reset;
     cc->reset = openrisc_cpu_reset;
 
@@ -180,45 +155,8 @@ static void openrisc_cpu_class_init(ObjectClass *oc, void *data)
     dc->vmsd = &vmstate_openrisc_cpu;
 #endif
     cc->gdb_num_core_regs = 32 + 3;
-}
-
-static void cpu_register(const OpenRISCCPUInfo *info)
-{
-    TypeInfo type_info = {
-        .parent = TYPE_OPENRISC_CPU,
-        .instance_size = sizeof(OpenRISCCPU),
-        .instance_init = info->initfn,
-        .class_size = sizeof(OpenRISCCPUClass),
-    };
-
-    type_info.name = g_strdup_printf("%s-" TYPE_OPENRISC_CPU, info->name);
-    type_register(&type_info);
-    g_free((void *)type_info.name);
-}
-
-static const TypeInfo openrisc_cpu_type_info = {
-    .name = TYPE_OPENRISC_CPU,
-    .parent = TYPE_CPU,
-    .instance_size = sizeof(OpenRISCCPU),
-    .instance_init = openrisc_cpu_initfn,
-    .abstract = true,
-    .class_size = sizeof(OpenRISCCPUClass),
-    .class_init = openrisc_cpu_class_init,
-};
-
-static void openrisc_cpu_register_types(void)
-{
-    int i;
-
-    type_register_static(&openrisc_cpu_type_info);
-    for (i = 0; i < ARRAY_SIZE(openrisc_cpus); i++) {
-        cpu_register(&openrisc_cpus[i]);
-    }
-}
-
-OpenRISCCPU *cpu_openrisc_init(const char *cpu_model)
-{
-    return OPENRISC_CPU(cpu_generic_init(TYPE_OPENRISC_CPU, cpu_model));
+    cc->tcg_initialize = openrisc_translate_init;
+    cc->disas_set_info = openrisc_disas_set_info;
 }
 
 /* Sort alphabetically by type name, except for "any". */
@@ -269,4 +207,25 @@ void cpu_openrisc_list(FILE *f, fprintf_function cpu_fprintf)
     g_slist_free(list);
 }
 
-type_init(openrisc_cpu_register_types)
+#define DEFINE_OPENRISC_CPU_TYPE(cpu_model, initfn) \
+    {                                               \
+        .parent = TYPE_OPENRISC_CPU,                \
+        .instance_init = initfn,                    \
+        .name = OPENRISC_CPU_TYPE_NAME(cpu_model),  \
+    }
+
+static const TypeInfo openrisc_cpus_type_infos[] = {
+    { /* base class should be registered first */
+        .name = TYPE_OPENRISC_CPU,
+        .parent = TYPE_CPU,
+        .instance_size = sizeof(OpenRISCCPU),
+        .instance_init = openrisc_cpu_initfn,
+        .abstract = true,
+        .class_size = sizeof(OpenRISCCPUClass),
+        .class_init = openrisc_cpu_class_init,
+    },
+    DEFINE_OPENRISC_CPU_TYPE("or1200", or1200_initfn),
+    DEFINE_OPENRISC_CPU_TYPE("any", openrisc_any_initfn),
+};
+
+DEFINE_TYPES(openrisc_cpus_type_infos)

@@ -26,6 +26,7 @@
  */
 
 #include "qemu/osdep.h"
+#include "qemu/units.h"
 #include "qapi/error.h"
 #include "qemu-common.h"
 #include "qemu/timer.h"
@@ -33,7 +34,7 @@
 #include "qapi/qmp/qerror.h"
 #include "qemu/error-report.h"
 #include "qemu/iov.h"
-#include "sysemu/char.h"
+#include "chardev/char-fe.h"
 
 #include <usbredirparser.h>
 #include <usbredirfilter.h>
@@ -106,10 +107,10 @@ struct USBRedirDevice {
     USBDevice dev;
     /* Properties */
     CharBackend cs;
-    uint8_t debug;
-    char *filter_str;
-    int32_t bootindex;
     bool enable_streams;
+    uint8_t debug;
+    int32_t bootindex;
+    char *filter_str;
     /* Data passed from chardev the fd_read cb to the usbredirparser read cb */
     const uint8_t *read_buf;
     int read_buf_size;
@@ -193,7 +194,7 @@ static void usbredir_handle_status(USBRedirDevice *dev, USBPacket *p,
 #define WARNING(...) \
     do { \
         if (dev->debug >= usbredirparser_warning) { \
-            error_report("usb-redir warning: " __VA_ARGS__); \
+            warn_report("" __VA_ARGS__); \
         } \
     } while (0)
 #define INFO(...) \
@@ -229,21 +230,10 @@ static void usbredir_log(void *priv, int level, const char *msg)
 static void usbredir_log_data(USBRedirDevice *dev, const char *desc,
     const uint8_t *data, int len)
 {
-    int i, j, n;
-
     if (dev->debug < usbredirparser_debug_data) {
         return;
     }
-
-    for (i = 0; i < len; i += j) {
-        char buf[128];
-
-        n = sprintf(buf, "%s", desc);
-        for (j = 0; j < 8 && i + j < len; j++) {
-            n += sprintf(buf + n, " %02X", data[i + j]);
-        }
-        error_report("%s", buf);
-    }
+    qemu_hexdump((char *)data, stderr, desc, len);
 }
 
 /*
@@ -284,10 +274,9 @@ static gboolean usbredir_write_unblocked(GIOChannel *chan, GIOCondition cond,
 static int usbredir_write(void *priv, uint8_t *data, int count)
 {
     USBRedirDevice *dev = priv;
-    Chardev *chr = qemu_chr_fe_get_driver(&dev->cs);
     int r;
 
-    if (!chr->be_open) {
+    if (!qemu_chr_fe_backend_open(&dev->cs)) {
         return 0;
     }
 
@@ -807,7 +796,7 @@ static void usbredir_handle_bulk_data(USBRedirDevice *dev, USBPacket *p,
            usbredirparser_peer_has_cap(dev->parser,
                                        usb_redir_cap_32bits_bulk_length));
 
-    if (ep & USB_DIR_IN) {
+    if (ep & USB_DIR_IN || size == 0) {
         usbredirparser_send_bulk_packet(dev->parser, p->id,
                                         &bulk_packet, NULL, 0);
     } else {
@@ -1310,7 +1299,7 @@ static int usbredir_chardev_can_read(void *opaque)
     }
 
     /* usbredir_parser_do_read will consume *all* data we give it */
-    return 1024 * 1024;
+    return 1 * MiB;
 }
 
 static void usbredir_chardev_read(void *opaque, const uint8_t *buf, int size)
@@ -1377,7 +1366,7 @@ static void usbredir_realize(USBDevice *udev, Error **errp)
     USBRedirDevice *dev = USB_REDIRECT(udev);
     int i;
 
-    if (!qemu_chr_fe_get_driver(&dev->cs)) {
+    if (!qemu_chr_fe_backend_connected(&dev->cs)) {
         error_setg(errp, QERR_MISSING_PARAMETER, "chardev");
         return;
     }
@@ -1410,7 +1399,7 @@ static void usbredir_realize(USBDevice *udev, Error **errp)
     /* Let the backend know we are ready */
     qemu_chr_fe_set_handlers(&dev->cs, usbredir_chardev_can_read,
                              usbredir_chardev_read, usbredir_chardev_event,
-                             dev, NULL, true);
+                             NULL, dev, NULL, true);
 
     dev->vmstate =
         qemu_add_vm_change_state_handler(usbredir_vm_state_change, dev);
@@ -1430,10 +1419,8 @@ static void usbredir_cleanup_device_queues(USBRedirDevice *dev)
 static void usbredir_unrealize(USBDevice *udev, Error **errp)
 {
     USBRedirDevice *dev = USB_REDIRECT(udev);
-    Chardev *chr = qemu_chr_fe_get_driver(&dev->cs);
 
-    qemu_chr_fe_deinit(&dev->cs);
-    qemu_chr_delete(chr);
+    qemu_chr_fe_deinit(&dev->cs, true);
 
     /* Note must be done after qemu_chr_close, as that causes a close event */
     qemu_bh_delete(dev->chardev_close_bh);
@@ -2125,11 +2112,13 @@ static void usbredir_buffered_bulk_packet(void *priv, uint64_t id,
  * Migration code
  */
 
-static void usbredir_pre_save(void *priv)
+static int usbredir_pre_save(void *priv)
 {
     USBRedirDevice *dev = priv;
 
     usbredir_fill_already_in_flight(dev);
+
+    return 0;
 }
 
 static int usbredir_post_load(void *priv, int version_id)

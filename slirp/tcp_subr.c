@@ -148,7 +148,16 @@ tcp_respond(struct tcpcb *tp, struct tcpiphdr *ti, struct mbuf *m,
 		m->m_data += IF_MAXLINKHDR;
 		*mtod(m, struct tcpiphdr *) = *ti;
 		ti = mtod(m, struct tcpiphdr *);
-		memset(&ti->ti, 0, sizeof(ti->ti));
+		switch (af) {
+		case AF_INET:
+		    ti->ti.ti_i4.ih_x1 = 0;
+		    break;
+		case AF_INET6:
+		    ti->ti.ti_i6.ih_x1 = 0;
+		    break;
+		default:
+		    g_assert_not_reached();
+		}
 		flags = TH_ACK;
 	} else {
 		/*
@@ -204,7 +213,7 @@ tcp_respond(struct tcpcb *tp, struct tcpiphdr *ti, struct mbuf *m,
 	    m->m_len  -= sizeof(struct tcpiphdr) - sizeof(struct tcphdr)
 	                                         - sizeof(struct ip);
 	    ip = mtod(m, struct ip *);
-	    ip->ip_len = tlen;
+	    ip->ip_len = m->m_len;
 	    ip->ip_dst = tcpiph_save.ti_dst;
 	    ip->ip_src = tcpiph_save.ti_src;
 	    ip->ip_p = tcpiph_save.ti_pr;
@@ -224,7 +233,7 @@ tcp_respond(struct tcpcb *tp, struct tcpiphdr *ti, struct mbuf *m,
 	    m->m_len  -= sizeof(struct tcpiphdr) - sizeof(struct tcphdr)
 	                                         - sizeof(struct ip6);
 	    ip6 = mtod(m, struct ip6 *);
-	    ip6->ip_pl = tlen;
+	    ip6->ip_pl = tcpiph_save.ti_len;
 	    ip6->ip_dst = tcpiph_save.ti_dst6;
 	    ip6->ip_src = tcpiph_save.ti_src6;
 	    ip6->ip_nh = tcpiph_save.ti_nh6;
@@ -407,6 +416,8 @@ int tcp_fconnect(struct socket *so, unsigned short af)
     socket_set_fast_reuse(s);
     opt = 1;
     qemu_setsockopt(s, SOL_SOCKET, SO_OOBINLINE, &opt, sizeof(opt));
+    opt = 1;
+    qemu_setsockopt(s, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
     addr = so->fhost.ss;
     DEBUG_CALL(" connect()ing")

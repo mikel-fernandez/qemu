@@ -48,22 +48,31 @@
 #define CPU_LDST_H
 
 #if defined(CONFIG_USER_ONLY)
-/* All direct uses of g2h and h2g need to go away for usermode softmmu.  */
-#define g2h(x) ((void *)((unsigned long)(target_ulong)(x) + guest_base))
-
-#if HOST_LONG_BITS <= TARGET_VIRT_ADDR_SPACE_BITS
-#define h2g_valid(x) 1
+/* sparc32plus has 64bit long but 32bit space address
+ * this can make bad result with g2h() and h2g()
+ */
+#if TARGET_VIRT_ADDR_SPACE_BITS <= 32
+typedef uint32_t abi_ptr;
+#define TARGET_ABI_FMT_ptr "%x"
 #else
-#define h2g_valid(x) ({ \
-    unsigned long __guest = (unsigned long)(x) - guest_base; \
-    (__guest < (1ul << TARGET_VIRT_ADDR_SPACE_BITS)) && \
-    (!reserved_va || (__guest < reserved_va)); \
-})
+typedef uint64_t abi_ptr;
+#define TARGET_ABI_FMT_ptr "%"PRIx64
 #endif
+
+/* All direct uses of g2h and h2g need to go away for usermode softmmu.  */
+#define g2h(x) ((void *)((unsigned long)(abi_ptr)(x) + guest_base))
+
+#define guest_addr_valid(x) ((x) <= GUEST_ADDR_MAX)
+#define h2g_valid(x) guest_addr_valid((unsigned long)(x) - guest_base)
+
+static inline int guest_range_valid(unsigned long start, unsigned long len)
+{
+    return len - 1 <= GUEST_ADDR_MAX && start <= GUEST_ADDR_MAX - len + 1;
+}
 
 #define h2g_nocheck(x) ({ \
     unsigned long __ret = (unsigned long)(x) - guest_base; \
-    (abi_ulong)__ret; \
+    (abi_ptr)__ret; \
 })
 
 #define h2g(x) ({ \
@@ -71,10 +80,14 @@
     assert(h2g_valid(x)); \
     h2g_nocheck(x); \
 })
-
+#else
+typedef target_ulong abi_ptr;
+#define TARGET_ABI_FMT_ptr TARGET_ABI_FMT_lx
 #endif
 
 #if defined(CONFIG_USER_ONLY)
+
+extern __thread uintptr_t helper_retaddr;
 
 /* In user-only mode we provide only the _code and _data accessors. */
 
@@ -397,7 +410,7 @@
  * This is the equivalent of the initial fast-path code used by
  * TCG backends for guest load and store accesses.
  */
-static inline void *tlb_vaddr_to_host(CPUArchState *env, target_ulong addr,
+static inline void *tlb_vaddr_to_host(CPUArchState *env, abi_ptr addr,
                                       int access_type, int mmu_idx)
 {
 #if defined(CONFIG_USER_ONLY)
@@ -405,7 +418,7 @@ static inline void *tlb_vaddr_to_host(CPUArchState *env, target_ulong addr,
 #else
     int index = (addr >> TARGET_PAGE_BITS) & (CPU_TLB_SIZE - 1);
     CPUTLBEntry *tlbentry = &env->tlb_table[mmu_idx][index];
-    target_ulong tlb_addr;
+    abi_ptr tlb_addr;
     uintptr_t haddr;
 
     switch (access_type) {
@@ -422,8 +435,7 @@ static inline void *tlb_vaddr_to_host(CPUArchState *env, target_ulong addr,
         g_assert_not_reached();
     }
 
-    if ((addr & TARGET_PAGE_MASK)
-        != (tlb_addr & (TARGET_PAGE_MASK | TLB_INVALID_MASK))) {
+    if (!tlb_hit(tlb_addr, addr)) {
         /* TLB entry is for a different page */
         return NULL;
     }

@@ -38,68 +38,19 @@
 #include "monitor/monitor.h"
 #include "hw/intc/intc.h"
 
-int xics_get_cpu_index_by_dt_id(int cpu_dt_id)
-{
-    PowerPCCPU *cpu = ppc_get_vcpu_by_dt_id(cpu_dt_id);
-
-    if (cpu) {
-        return cpu->parent_obj.cpu_index;
-    }
-
-    return -1;
-}
-
-void xics_cpu_destroy(XICSFabric *xi, PowerPCCPU *cpu)
-{
-    CPUState *cs = CPU(cpu);
-    ICPState *icp = xics_icp_get(xi, cs->cpu_index);
-
-    assert(icp);
-    assert(cs == icp->cs);
-
-    icp->output = NULL;
-    icp->cs = NULL;
-}
-
-void xics_cpu_setup(XICSFabric *xi, PowerPCCPU *cpu)
-{
-    CPUState *cs = CPU(cpu);
-    CPUPPCState *env = &cpu->env;
-    ICPState *icp = xics_icp_get(xi, cs->cpu_index);
-    ICPStateClass *icpc;
-
-    assert(icp);
-
-    icp->cs = cs;
-
-    icpc = ICP_GET_CLASS(icp);
-    if (icpc->cpu_setup) {
-        icpc->cpu_setup(icp, cpu);
-    }
-
-    switch (PPC_INPUT(env)) {
-    case PPC_FLAGS_INPUT_POWER7:
-        icp->output = env->irq_inputs[POWER7_INPUT_INT];
-        break;
-
-    case PPC_FLAGS_INPUT_970:
-        icp->output = env->irq_inputs[PPC970_INPUT_INT];
-        break;
-
-    default:
-        error_report("XICS interrupt controller does not support this CPU "
-                     "bus model");
-        abort();
-    }
-}
-
 void icp_pic_print_info(ICPState *icp, Monitor *mon)
 {
+    ICPStateClass *icpc = ICP_GET_CLASS(icp);
     int cpu_index = icp->cs ? icp->cs->cpu_index : -1;
 
     if (!icp->output) {
         return;
     }
+
+    if (icpc->synchronize_state) {
+        icpc->synchronize_state(icp);
+    }
+
     monitor_printf(mon, "CPU %d XIRR=%08x (%p) PP=%02x MFRR=%02x\n",
                    cpu_index, icp->xirr, icp->xirr_owner,
                    icp->pending_priority, icp->mfrr);
@@ -107,6 +58,7 @@ void icp_pic_print_info(ICPState *icp, Monitor *mon)
 
 void ics_pic_print_info(ICSState *ics, Monitor *mon)
 {
+    ICSStateClass *icsc = ICS_BASE_GET_CLASS(ics);
     uint32_t i;
 
     monitor_printf(mon, "ICS %4x..%4x %p\n",
@@ -114,6 +66,10 @@ void ics_pic_print_info(ICSState *ics, Monitor *mon)
 
     if (!ics->irqs) {
         return;
+    }
+
+    if (icsc->synchronize_state) {
+        icsc->synchronize_state(ics);
     }
 
     for (i = 0; i < ics->nr_irqs; i++) {
@@ -296,7 +252,7 @@ static void icp_irq(ICSState *ics, int server, int nr, uint8_t priority)
     }
 }
 
-static void icp_dispatch_pre_save(void *opaque)
+static int icp_dispatch_pre_save(void *opaque)
 {
     ICPState *icp = opaque;
     ICPStateClass *info = ICP_GET_CLASS(icp);
@@ -304,6 +260,8 @@ static void icp_dispatch_pre_save(void *opaque)
     if (info->pre_save) {
         info->pre_save(icp);
     }
+
+    return 0;
 }
 
 static int icp_dispatch_post_load(void *opaque, int version_id)
@@ -333,7 +291,7 @@ static const VMStateDescription vmstate_icp_server = {
     },
 };
 
-static void icp_reset(void *dev)
+static void icp_reset(DeviceState *dev)
 {
     ICPState *icp = ICP(dev);
 
@@ -345,31 +303,74 @@ static void icp_reset(void *dev)
     qemu_set_irq(icp->output, 0);
 }
 
+static void icp_reset_handler(void *dev)
+{
+    DeviceClass *dc = DEVICE_GET_CLASS(dev);
+
+    dc->reset(dev);
+}
+
 static void icp_realize(DeviceState *dev, Error **errp)
 {
     ICPState *icp = ICP(dev);
+    PowerPCCPU *cpu;
+    CPUPPCState *env;
     Object *obj;
     Error *err = NULL;
 
-    obj = object_property_get_link(OBJECT(dev), "xics", &err);
+    obj = object_property_get_link(OBJECT(dev), ICP_PROP_XICS, &err);
     if (!obj) {
-        error_setg(errp, "%s: required link 'xics' not found: %s",
-                   __func__, error_get_pretty(err));
+        error_propagate(errp, err);
+        error_prepend(errp, "required link '" ICP_PROP_XICS "' not found: ");
         return;
     }
 
     icp->xics = XICS_FABRIC(obj);
 
-    qemu_register_reset(icp_reset, dev);
+    obj = object_property_get_link(OBJECT(dev), ICP_PROP_CPU, &err);
+    if (!obj) {
+        error_propagate(errp, err);
+        error_prepend(errp, "required link '" ICP_PROP_CPU "' not found: ");
+        return;
+    }
+
+    cpu = POWERPC_CPU(obj);
+    icp->cs = CPU(obj);
+
+    env = &cpu->env;
+    switch (PPC_INPUT(env)) {
+    case PPC_FLAGS_INPUT_POWER7:
+        icp->output = env->irq_inputs[POWER7_INPUT_INT];
+        break;
+
+    case PPC_FLAGS_INPUT_970:
+        icp->output = env->irq_inputs[PPC970_INPUT_INT];
+        break;
+
+    default:
+        error_setg(errp, "XICS interrupt controller does not support this CPU bus model");
+        return;
+    }
+
+    qemu_register_reset(icp_reset_handler, dev);
+    vmstate_register(NULL, icp->cs->cpu_index, &vmstate_icp_server, icp);
 }
 
+static void icp_unrealize(DeviceState *dev, Error **errp)
+{
+    ICPState *icp = ICP(dev);
+
+    vmstate_unregister(NULL, &vmstate_icp_server, icp);
+    qemu_unregister_reset(icp_reset_handler, dev);
+}
 
 static void icp_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
-    dc->vmsd = &vmstate_icp_server;
     dc->realize = icp_realize;
+    dc->unrealize = icp_unrealize;
+    dc->reset = icp_reset;
 }
 
 static const TypeInfo icp_info = {
@@ -379,6 +380,27 @@ static const TypeInfo icp_info = {
     .class_init = icp_class_init,
     .class_size = sizeof(ICPStateClass),
 };
+
+Object *icp_create(Object *cpu, const char *type, XICSFabric *xi, Error **errp)
+{
+    Error *local_err = NULL;
+    Object *obj;
+
+    obj = object_new(type);
+    object_property_add_child(cpu, type, obj, &error_abort);
+    object_unref(obj);
+    object_property_add_const_link(obj, ICP_PROP_XICS, OBJECT(xi),
+                                   &error_abort);
+    object_property_add_const_link(obj, ICP_PROP_CPU, cpu, &error_abort);
+    object_property_set_bool(obj, true, "realized", &local_err);
+    if (local_err) {
+        object_unparent(obj);
+        error_propagate(errp, local_err);
+        obj = NULL;
+    }
+
+    return obj;
+}
 
 /*
  * ICS: Source layer
@@ -523,9 +545,61 @@ static void ics_simple_eoi(ICSState *ics, uint32_t nr)
     }
 }
 
-static void ics_simple_reset(void *dev)
+static void ics_simple_reset(DeviceState *dev)
+{
+    ICSStateClass *icsc = ICS_BASE_GET_CLASS(dev);
+
+    icsc->parent_reset(dev);
+}
+
+static void ics_simple_reset_handler(void *dev)
+{
+    ics_simple_reset(dev);
+}
+
+static void ics_simple_realize(DeviceState *dev, Error **errp)
 {
     ICSState *ics = ICS_SIMPLE(dev);
+    ICSStateClass *icsc = ICS_BASE_GET_CLASS(ics);
+    Error *local_err = NULL;
+
+    icsc->parent_realize(dev, &local_err);
+    if (local_err) {
+        error_propagate(errp, local_err);
+        return;
+    }
+
+    ics->qirqs = qemu_allocate_irqs(ics_simple_set_irq, ics, ics->nr_irqs);
+
+    qemu_register_reset(ics_simple_reset_handler, ics);
+}
+
+static void ics_simple_class_init(ObjectClass *klass, void *data)
+{
+    DeviceClass *dc = DEVICE_CLASS(klass);
+    ICSStateClass *isc = ICS_BASE_CLASS(klass);
+
+    device_class_set_parent_realize(dc, ics_simple_realize,
+                                    &isc->parent_realize);
+    device_class_set_parent_reset(dc, ics_simple_reset,
+                                  &isc->parent_reset);
+
+    isc->reject = ics_simple_reject;
+    isc->resend = ics_simple_resend;
+    isc->eoi = ics_simple_eoi;
+}
+
+static const TypeInfo ics_simple_info = {
+    .name = TYPE_ICS_SIMPLE,
+    .parent = TYPE_ICS_BASE,
+    .instance_size = sizeof(ICSState),
+    .class_init = ics_simple_class_init,
+    .class_size = sizeof(ICSStateClass),
+};
+
+static void ics_base_reset(DeviceState *dev)
+{
+    ICSState *ics = ICS_BASE(dev);
     int i;
     uint8_t flags[ics->nr_irqs];
 
@@ -542,7 +616,35 @@ static void ics_simple_reset(void *dev)
     }
 }
 
-static void ics_simple_dispatch_pre_save(void *opaque)
+static void ics_base_realize(DeviceState *dev, Error **errp)
+{
+    ICSState *ics = ICS_BASE(dev);
+    Object *obj;
+    Error *err = NULL;
+
+    obj = object_property_get_link(OBJECT(dev), ICS_PROP_XICS, &err);
+    if (!obj) {
+        error_propagate(errp, err);
+        error_prepend(errp, "required link '" ICS_PROP_XICS "' not found: ");
+        return;
+    }
+    ics->xics = XICS_FABRIC(obj);
+
+    if (!ics->nr_irqs) {
+        error_setg(errp, "Number of interrupts needs to be greater 0");
+        return;
+    }
+    ics->irqs = g_malloc0(ics->nr_irqs * sizeof(ICSIRQState));
+}
+
+static void ics_base_instance_init(Object *obj)
+{
+    ICSState *ics = ICS_BASE(obj);
+
+    ics->offset = XICS_IRQ_BASE;
+}
+
+static int ics_base_dispatch_pre_save(void *opaque)
 {
     ICSState *ics = opaque;
     ICSStateClass *info = ICS_BASE_GET_CLASS(ics);
@@ -550,9 +652,11 @@ static void ics_simple_dispatch_pre_save(void *opaque)
     if (info->pre_save) {
         info->pre_save(ics);
     }
+
+    return 0;
 }
 
-static int ics_simple_dispatch_post_load(void *opaque, int version_id)
+static int ics_base_dispatch_post_load(void *opaque, int version_id)
 {
     ICSState *ics = opaque;
     ICSStateClass *info = ICS_BASE_GET_CLASS(ics);
@@ -564,7 +668,7 @@ static int ics_simple_dispatch_post_load(void *opaque, int version_id)
     return 0;
 }
 
-static const VMStateDescription vmstate_ics_simple_irq = {
+static const VMStateDescription vmstate_ics_base_irq = {
     .name = "ics/irq",
     .version_id = 2,
     .minimum_version_id = 1,
@@ -578,97 +682,36 @@ static const VMStateDescription vmstate_ics_simple_irq = {
     },
 };
 
-static const VMStateDescription vmstate_ics_simple = {
+static const VMStateDescription vmstate_ics_base = {
     .name = "ics",
     .version_id = 1,
     .minimum_version_id = 1,
-    .pre_save = ics_simple_dispatch_pre_save,
-    .post_load = ics_simple_dispatch_post_load,
+    .pre_save = ics_base_dispatch_pre_save,
+    .post_load = ics_base_dispatch_post_load,
     .fields = (VMStateField[]) {
         /* Sanity check */
-        VMSTATE_UINT32_EQUAL(nr_irqs, ICSState),
+        VMSTATE_UINT32_EQUAL(nr_irqs, ICSState, NULL),
 
         VMSTATE_STRUCT_VARRAY_POINTER_UINT32(irqs, ICSState, nr_irqs,
-                                             vmstate_ics_simple_irq,
+                                             vmstate_ics_base_irq,
                                              ICSIRQState),
         VMSTATE_END_OF_LIST()
     },
 };
 
-static void ics_simple_initfn(Object *obj)
-{
-    ICSState *ics = ICS_SIMPLE(obj);
-
-    ics->offset = XICS_IRQ_BASE;
-}
-
-static void ics_simple_realize(DeviceState *dev, Error **errp)
-{
-    ICSState *ics = ICS_SIMPLE(dev);
-
-    if (!ics->nr_irqs) {
-        error_setg(errp, "Number of interrupts needs to be greater 0");
-        return;
-    }
-    ics->irqs = g_malloc0(ics->nr_irqs * sizeof(ICSIRQState));
-    ics->qirqs = qemu_allocate_irqs(ics_simple_set_irq, ics, ics->nr_irqs);
-
-    qemu_register_reset(ics_simple_reset, dev);
-}
-
-static Property ics_simple_properties[] = {
+static Property ics_base_properties[] = {
     DEFINE_PROP_UINT32("nr-irqs", ICSState, nr_irqs, 0),
     DEFINE_PROP_END_OF_LIST(),
 };
-
-static void ics_simple_class_init(ObjectClass *klass, void *data)
-{
-    DeviceClass *dc = DEVICE_CLASS(klass);
-    ICSStateClass *isc = ICS_BASE_CLASS(klass);
-
-    isc->realize = ics_simple_realize;
-    dc->props = ics_simple_properties;
-    dc->vmsd = &vmstate_ics_simple;
-    isc->reject = ics_simple_reject;
-    isc->resend = ics_simple_resend;
-    isc->eoi = ics_simple_eoi;
-}
-
-static const TypeInfo ics_simple_info = {
-    .name = TYPE_ICS_SIMPLE,
-    .parent = TYPE_ICS_BASE,
-    .instance_size = sizeof(ICSState),
-    .class_init = ics_simple_class_init,
-    .class_size = sizeof(ICSStateClass),
-    .instance_init = ics_simple_initfn,
-};
-
-static void ics_base_realize(DeviceState *dev, Error **errp)
-{
-    ICSStateClass *icsc = ICS_BASE_GET_CLASS(dev);
-    ICSState *ics = ICS_BASE(dev);
-    Object *obj;
-    Error *err = NULL;
-
-    obj = object_property_get_link(OBJECT(dev), "xics", &err);
-    if (!obj) {
-        error_setg(errp, "%s: required link 'xics' not found: %s",
-                   __func__, error_get_pretty(err));
-        return;
-    }
-    ics->xics = XICS_FABRIC(obj);
-
-
-    if (icsc->realize) {
-        icsc->realize(dev, errp);
-    }
-}
 
 static void ics_base_class_init(ObjectClass *klass, void *data)
 {
     DeviceClass *dc = DEVICE_CLASS(klass);
 
     dc->realize = ics_base_realize;
+    dc->props = ics_base_properties;
+    dc->reset = ics_base_reset;
+    dc->vmsd = &vmstate_ics_base;
 }
 
 static const TypeInfo ics_base_info = {
@@ -676,6 +719,7 @@ static const TypeInfo ics_base_info = {
     .parent = TYPE_DEVICE,
     .abstract = true,
     .instance_size = sizeof(ICSState),
+    .instance_init = ics_base_instance_init,
     .class_init = ics_base_class_init,
     .class_size = sizeof(ICSStateClass),
 };
@@ -689,18 +733,6 @@ static const TypeInfo xics_fabric_info = {
 /*
  * Exported functions
  */
-qemu_irq xics_get_qirq(XICSFabric *xi, int irq)
-{
-    XICSFabricClass *xic = XICS_FABRIC_GET_CLASS(xi);
-    ICSState *ics = xic->ics_get(xi, irq);
-
-    if (ics) {
-        return ics->qirqs[irq - ics->offset];
-    }
-
-    return NULL;
-}
-
 ICPState *xics_icp_get(XICSFabric *xi, int server)
 {
     XICSFabricClass *xic = XICS_FABRIC_GET_CLASS(xi);

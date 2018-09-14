@@ -17,7 +17,7 @@
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
 #include "qemu/osdep.h"
-#include "qapi/error.h"
+#include "qemu/units.h"
 #include "cpu.h"
 #include "exec/helper-proto.h"
 #include "sysemu/kvm.h"
@@ -30,6 +30,7 @@
 #include "helper_regs.h"
 #include "qemu/error-report.h"
 #include "mmu-book3s-v3.h"
+#include "mmu-radix64.h"
 
 //#define DEBUG_MMU
 //#define DEBUG_BATS
@@ -1090,11 +1091,10 @@ static void mmubooke_dump_mmu(FILE *f, fprintf_function cpu_fprintf,
         pa = entry->RPN & mask;
         /* Extend the physical address to 36 bits */
         pa |= (hwaddr)(entry->RPN & 0xF) << 32;
-        size /= 1024;
-        if (size >= 1024) {
-            snprintf(size_buf, sizeof(size_buf), "%3" PRId64 "M", size / 1024);
+        if (size >= 1 * MiB) {
+            snprintf(size_buf, sizeof(size_buf), "%3" PRId64 "M", size / MiB);
         } else {
-            snprintf(size_buf, sizeof(size_buf), "%3" PRId64 "k", size);
+            snprintf(size_buf, sizeof(size_buf), "%3" PRId64 "k", size / KiB);
         }
         cpu_fprintf(f, "0x%016" PRIx64 " 0x%016" PRIx64 " %s %-5u %08x %08x\n",
                     (uint64_t)ea, (uint64_t)pa, size_buf, (uint32_t)entry->PID,
@@ -1266,7 +1266,7 @@ static void mmu6xx_dump_mmu(FILE *f, fprintf_function cpu_fprintf,
 
 void dump_mmu(FILE *f, fprintf_function cpu_fprintf, CPUPPCState *env)
 {
-    switch (POWERPC_MMU_VER(env->mmu_model)) {
+    switch (env->mmu_model) {
     case POWERPC_MMU_BOOKE:
         mmubooke_dump_mmu(f, cpu_fprintf, env);
         break;
@@ -1278,13 +1278,13 @@ void dump_mmu(FILE *f, fprintf_function cpu_fprintf, CPUPPCState *env)
         mmu6xx_dump_mmu(f, cpu_fprintf, env);
         break;
 #if defined(TARGET_PPC64)
-    case POWERPC_MMU_VER_64B:
-    case POWERPC_MMU_VER_2_03:
-    case POWERPC_MMU_VER_2_06:
-    case POWERPC_MMU_VER_2_07:
+    case POWERPC_MMU_64B:
+    case POWERPC_MMU_2_03:
+    case POWERPC_MMU_2_06:
+    case POWERPC_MMU_2_07:
         dump_slb(f, cpu_fprintf, ppc_env_get_cpu(env));
         break;
-    case POWERPC_MMU_VER_3_00:
+    case POWERPC_MMU_3_00:
         if (ppc64_radix_guest(ppc_env_get_cpu(env))) {
             /* TODO - Unsupported */
         } else {
@@ -1423,16 +1423,16 @@ hwaddr ppc_cpu_get_phys_page_debug(CPUState *cs, vaddr addr)
     CPUPPCState *env = &cpu->env;
     mmu_ctx_t ctx;
 
-    switch (POWERPC_MMU_VER(env->mmu_model)) {
+    switch (env->mmu_model) {
 #if defined(TARGET_PPC64)
-    case POWERPC_MMU_VER_64B:
-    case POWERPC_MMU_VER_2_03:
-    case POWERPC_MMU_VER_2_06:
-    case POWERPC_MMU_VER_2_07:
+    case POWERPC_MMU_64B:
+    case POWERPC_MMU_2_03:
+    case POWERPC_MMU_2_06:
+    case POWERPC_MMU_2_07:
         return ppc_hash64_get_phys_page_debug(cpu, addr);
-    case POWERPC_MMU_VER_3_00:
+    case POWERPC_MMU_3_00:
         if (ppc64_radix_guest(ppc_env_get_cpu(env))) {
-            /* TODO - Unsupported */
+            return ppc_radix64_get_phys_page_debug(cpu, addr);
         } else {
             return ppc_hash64_get_phys_page_debug(cpu, addr);
         }
@@ -1550,7 +1550,7 @@ static int cpu_ppc_handle_mmu_fault(CPUPPCState *env, target_ulong address,
                     env->spr[SPR_40x_ESR] = 0x00000000;
                     break;
                 case POWERPC_MMU_BOOKE206:
-                    booke206_update_mas_tlb_miss(env, address, rw);
+                    booke206_update_mas_tlb_miss(env, address, 2);
                     /* fall through */
                 case POWERPC_MMU_BOOKE:
                     cs->exception_index = POWERPC_EXCP_ITLB;
@@ -2027,6 +2027,35 @@ void ppc_store_sdr1(CPUPPCState *env, target_ulong value)
     /* FIXME: Should check for valid HTABMASK values in 32-bit case */
     env->spr[SPR_SDR1] = value;
 }
+
+#if defined(TARGET_PPC64)
+void ppc_store_ptcr(CPUPPCState *env, target_ulong value)
+{
+    PowerPCCPU *cpu = ppc_env_get_cpu(env);
+    target_ulong ptcr_mask = PTCR_PATB | PTCR_PATS;
+    target_ulong patbsize = value & PTCR_PATS;
+
+    qemu_log_mask(CPU_LOG_MMU, "%s: " TARGET_FMT_lx "\n", __func__, value);
+
+    assert(!cpu->vhyp);
+    assert(env->mmu_model & POWERPC_MMU_3_00);
+
+    if (value & ~ptcr_mask) {
+        error_report("Invalid bits 0x"TARGET_FMT_lx" set in PTCR",
+                     value & ~ptcr_mask);
+        value &= ptcr_mask;
+    }
+
+    if (patbsize > 24) {
+        error_report("Invalid Partition Table size 0x" TARGET_FMT_lx
+                     " stored in PTCR", patbsize);
+        return;
+    }
+
+    env->spr[SPR_PTCR] = value;
+}
+
+#endif /* defined(TARGET_PPC64) */
 
 /* Segment registers load and store */
 target_ulong helper_load_sr(CPUPPCState *env, target_ulong sr_num)
@@ -2569,6 +2598,17 @@ void helper_booke_setpid(CPUPPCState *env, uint32_t pidn, target_ulong pid)
     tlb_flush(CPU(cpu));
 }
 
+static inline void flush_page(CPUPPCState *env, ppcmas_tlb_t *tlb)
+{
+    PowerPCCPU *cpu = ppc_env_get_cpu(env);
+
+    if (booke206_tlb_to_page_size(env, tlb) == TARGET_PAGE_SIZE) {
+        tlb_flush_page(CPU(cpu), tlb->mas2 & MAS2_EPN_MASK);
+    } else {
+        tlb_flush(CPU(cpu));
+    }
+}
+
 void helper_booke206_tlbwe(CPUPPCState *env)
 {
     PowerPCCPU *cpu = ppc_env_get_cpu(env);
@@ -2627,16 +2667,35 @@ void helper_booke206_tlbwe(CPUPPCState *env)
     if (msr_gs) {
         cpu_abort(CPU(cpu), "missing HV implementation\n");
     }
+
+    if (tlb->mas1 & MAS1_VALID) {
+        /* Invalidate the page in QEMU TLB if it was a valid entry.
+         *
+         * In "PowerPC e500 Core Family Reference Manual, Rev. 1",
+         * Section "12.4.2 TLB Write Entry (tlbwe) Instruction":
+         * (https://www.nxp.com/docs/en/reference-manual/E500CORERM.pdf)
+         *
+         * "Note that when an L2 TLB entry is written, it may be displacing an
+         * already valid entry in the same L2 TLB location (a victim). If a
+         * valid L1 TLB entry corresponds to the L2 MMU victim entry, that L1
+         * TLB entry is automatically invalidated." */
+        flush_page(env, tlb);
+    }
+
     tlb->mas7_3 = ((uint64_t)env->spr[SPR_BOOKE_MAS7] << 32) |
         env->spr[SPR_BOOKE_MAS3];
     tlb->mas1 = env->spr[SPR_BOOKE_MAS1];
 
-    /* MAV 1.0 only */
-    if (!(tlbncfg & TLBnCFG_AVAIL)) {
-        /* force !AVAIL TLB entries to correct page size */
-        tlb->mas1 &= ~MAS1_TSIZE_MASK;
-        /* XXX can be configured in MMUCSR0 */
-        tlb->mas1 |= (tlbncfg & TLBnCFG_MINSIZE) >> 12;
+    if ((env->spr[SPR_MMUCFG] & MMUCFG_MAVN) == MMUCFG_MAVN_V2) {
+        /* For TLB which has a fixed size TSIZE is ignored with MAV2 */
+        booke206_fixed_size_tlbn(env, tlbn, tlb);
+    } else {
+        if (!(tlbncfg & TLBnCFG_AVAIL)) {
+            /* force !AVAIL TLB entries to correct page size */
+            tlb->mas1 &= ~MAS1_TSIZE_MASK;
+            /* XXX can be configured in MMUCSR0 */
+            tlb->mas1 |= (tlbncfg & TLBnCFG_MINSIZE) >> 12;
+        }
     }
 
     /* Make a mask from TLB size to discard invalid bits in EPN field */
@@ -2658,11 +2717,7 @@ void helper_booke206_tlbwe(CPUPPCState *env)
         tlb->mas1 &= ~MAS1_IPROT;
     }
 
-    if (booke206_tlb_to_page_size(env, tlb) == TARGET_PAGE_SIZE) {
-        tlb_flush_page(CPU(cpu), tlb->mas2 & MAS2_EPN_MASK);
-    } else {
-        tlb_flush(CPU(cpu));
-    }
+    flush_page(env, tlb);
 }
 
 static inline void booke206_tlb_to_mas(CPUPPCState *env, ppcmas_tlb_t *tlb)
@@ -2898,8 +2953,8 @@ void helper_check_tlb_flush_global(CPUPPCState *env)
    NULL, it means that the function was called in C code (i.e. not
    from generated code or from helper.c) */
 /* XXX: fix it to restore all registers */
-void tlb_fill(CPUState *cs, target_ulong addr, MMUAccessType access_type,
-              int mmu_idx, uintptr_t retaddr)
+void tlb_fill(CPUState *cs, target_ulong addr, int size,
+              MMUAccessType access_type, int mmu_idx, uintptr_t retaddr)
 {
     PowerPCCPU *cpu = POWERPC_CPU(cs);
     PowerPCCPUClass *pcc = POWERPC_CPU_GET_CLASS(cs);
