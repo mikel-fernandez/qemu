@@ -17,8 +17,8 @@ import sys
 import logging
 import time
 import datetime
-sys.path.append(os.path.join(os.path.dirname(__file__), "..", "..", "scripts"))
-from qemu import QEMUMachine
+sys.path.append(os.path.join(os.path.dirname(__file__), '..', '..', 'python'))
+from qemu import QEMUMachine, kvm_available
 import subprocess
 import hashlib
 import optparse
@@ -42,6 +42,8 @@ class BaseVM(object):
     BUILD_SCRIPT = ""
     # The guest name, to be overridden by subclasses
     name = "#base"
+    # The guest architecture, to be overridden by subclasses
+    arch = "#arch"
     def __init__(self, debug=False, vcpus=None):
         self._guest = None
         self._tmpdir = os.path.realpath(tempfile.mkdtemp(prefix="vm-test-",
@@ -65,18 +67,17 @@ class BaseVM(object):
             self._stdout = self._devnull
         self._args = [ \
             "-nodefaults", "-m", "4G",
+            "-cpu", "max",
             "-netdev", "user,id=vnet,hostfwd=:127.0.0.1:0-:22",
             "-device", "virtio-net-pci,netdev=vnet",
             "-vnc", "127.0.0.1:0,to=20",
             "-serial", "file:%s" % os.path.join(self._tmpdir, "serial.out")]
-        if vcpus:
+        if vcpus and vcpus > 1:
             self._args += ["-smp", str(vcpus)]
-        if os.access("/dev/kvm", os.R_OK | os.W_OK):
-            self._args += ["-cpu", "host"]
+        if kvm_available(self.arch):
             self._args += ["-enable-kvm"]
         else:
             logging.info("KVM not available, not using -enable-kvm")
-            self._args += ["-cpu", "max"]
         self._data_args = []
 
     def _download_with_cache(self, url, sha256sum=None):
@@ -152,7 +153,7 @@ class BaseVM(object):
             "-device", "virtio-blk,drive=drive0,bootindex=0"]
         args += self._data_args + extra_args
         logging.debug("QEMU args: %s", " ".join(args))
-        qemu_bin = os.environ.get("QEMU", "qemu-system-x86_64")
+        qemu_bin = os.environ.get("QEMU", "qemu-system-" + self.arch)
         guest = QEMUMachine(binary=qemu_bin, args=args)
         try:
             guest.launch()
@@ -178,11 +179,14 @@ class BaseVM(object):
 
     def wait_ssh(self, seconds=300):
         starttime = datetime.datetime.now()
+        endtime = starttime + datetime.timedelta(seconds=seconds)
         guest_up = False
-        while (datetime.datetime.now() - starttime).total_seconds() < seconds:
+        while datetime.datetime.now() < endtime:
             if self.ssh("exit 0") == 0:
                 guest_up = True
                 break
+            seconds = (endtime - datetime.datetime.now()).total_seconds()
+            logging.debug("%ds before timeout", seconds)
             time.sleep(1)
         if not guest_up:
             raise Exception("Timeout while waiting for guest ssh")
@@ -196,7 +200,14 @@ class BaseVM(object):
     def qmp(self, *args, **kwargs):
         return self._guest.qmp(*args, **kwargs)
 
-def parse_args(vm_name):
+def parse_args(vmcls):
+
+    def get_default_jobs():
+        if kvm_available(vmcls.arch):
+            return multiprocessing.cpu_count() / 2
+        else:
+            return 1
+
     parser = optparse.OptionParser(
         description="VM test utility.  Exit codes: "
                     "0 = success, "
@@ -205,11 +216,11 @@ def parse_args(vm_name):
                     "3 = test command failed")
     parser.add_option("--debug", "-D", action="store_true",
                       help="enable debug output")
-    parser.add_option("--image", "-i", default="%s.img" % vm_name,
+    parser.add_option("--image", "-i", default="%s.img" % vmcls.name,
                       help="image file name")
     parser.add_option("--force", "-f", action="store_true",
                       help="force build image even if image exists")
-    parser.add_option("--jobs", type=int, default=multiprocessing.cpu_count() / 2,
+    parser.add_option("--jobs", type=int, default=get_default_jobs(),
                       help="number of virtual CPUs")
     parser.add_option("--verbose", "-V", action="store_true",
                       help="Pass V=1 to builds within the guest")
@@ -217,6 +228,8 @@ def parse_args(vm_name):
                       help="build image")
     parser.add_option("--build-qemu",
                       help="build QEMU from source in guest")
+    parser.add_option("--build-target",
+                      help="QEMU build target", default="check")
     parser.add_option("--interactive", "-I", action="store_true",
                       help="Interactively run command")
     parser.add_option("--snapshot", "-s", action="store_true",
@@ -226,7 +239,7 @@ def parse_args(vm_name):
 
 def main(vmcls):
     try:
-        args, argv = parse_args(vmcls.name)
+        args, argv = parse_args(vmcls)
         if not argv and not args.build_qemu and not args.build_image:
             print("Nothing to do?")
             return 1
@@ -244,6 +257,7 @@ def main(vmcls):
             cmd = [vm.BUILD_SCRIPT.format(
                    configure_opts = " ".join(argv),
                    jobs=args.jobs,
+                   target=args.build_target,
                    verbose = "V=1" if args.verbose else "")]
         else:
             cmd = argv

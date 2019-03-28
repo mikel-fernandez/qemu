@@ -353,6 +353,8 @@ static uint16_t base_GEN14_GA1[] = {
     S390_FEAT_ORDER_PRESERVING_COMPRESSION,
 };
 
+#define base_GEN14_GA2 EmptyFeat
+
 /* Full features (in order of release)
  * Automatically includes corresponding base features.
  * Full features are all features this hardware supports even if kvm/QEMU do not
@@ -447,6 +449,9 @@ static uint16_t full_GEN12_GA1[] = {
     S390_FEAT_ADAPTER_INT_SUPPRESSION,
     S390_FEAT_EDAT_2,
     S390_FEAT_SIDE_EFFECT_ACCESS_ESOP2,
+    S390_FEAT_AP_QUERY_CONFIG_INFO,
+    S390_FEAT_AP_FACILITIES_TEST,
+    S390_FEAT_AP,
 };
 
 static uint16_t full_GEN12_GA2[] = {
@@ -476,6 +481,8 @@ static uint16_t full_GEN14_GA1[] = {
     S390_FEAT_SIE_KSS,
     S390_FEAT_GROUP_MULTIPLE_EPOCH_PTFF,
 };
+
+#define full_GEN14_GA2 EmptyFeat
 
 /* Default features (in order of release)
  * Automatically includes corresponding base features.
@@ -547,7 +554,11 @@ static uint16_t default_GEN14_GA1[] = {
     S390_FEAT_GROUP_MSA_EXT_6,
     S390_FEAT_GROUP_MSA_EXT_7,
     S390_FEAT_GROUP_MSA_EXT_8,
+    S390_FEAT_MULTIPLE_EPOCH,
+    S390_FEAT_GROUP_MULTIPLE_EPOCH_PTFF,
 };
+
+#define default_GEN14_GA2 EmptyFeat
 
 /* QEMU (CPU model) features */
 
@@ -557,7 +568,7 @@ static uint16_t qemu_V2_11[] = {
     S390_FEAT_ZARCH,
 };
 
-static uint16_t qemu_LATEST[] = {
+static uint16_t qemu_V3_1[] = {
     S390_FEAT_DAT_ENH,
     S390_FEAT_IDTE_SEGMENT,
     S390_FEAT_STFLE,
@@ -589,14 +600,21 @@ static uint16_t qemu_LATEST[] = {
     S390_FEAT_MSA_EXT_4,
 };
 
+static uint16_t qemu_LATEST[] = {
+    /*
+     * Only BFP bits are implemented (HFP, DFP, PFPO and DIVIDE TO INTEGER not
+     * implemented yet).
+     */
+    S390_FEAT_FLOATING_POINT_EXT,
+    S390_FEAT_ZPCI,
+};
+
 /* add all new definitions before this point */
 static uint16_t qemu_MAX[] = {
     /* z13+ features */
     S390_FEAT_STFLE_53,
     /* generates a dependency warning, leave it out for now */
     S390_FEAT_MSA_EXT_5,
-    /* only with CONFIG_PCI */
-    S390_FEAT_ZPCI,
 };
 
 /****** END FEATURE DEFS ******/
@@ -657,6 +675,7 @@ static CpuFeatDefSpec CpuFeatDef[] = {
     CPU_FEAT_INITIALIZER(GEN13_GA1),
     CPU_FEAT_INITIALIZER(GEN13_GA2),
     CPU_FEAT_INITIALIZER(GEN14_GA1),
+    CPU_FEAT_INITIALIZER(GEN14_GA2),
 };
 
 #define FEAT_GROUP_INITIALIZER(_name)                  \
@@ -706,6 +725,7 @@ static FeatGroupDefSpec FeatGroupDef[] = {
  *******************************/
 static FeatGroupDefSpec QemuFeatDef[] = {
     QEMU_FEAT_INITIALIZER(V2_11),
+    QEMU_FEAT_INITIALIZER(V3_1),
     QEMU_FEAT_INITIALIZER(LATEST),
     QEMU_FEAT_INITIALIZER(MAX),
 };

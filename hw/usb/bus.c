@@ -59,12 +59,6 @@ static int usb_device_post_load(void *opaque, int version_id)
     } else {
         dev->attached = true;
     }
-    if (dev->setup_index < 0 ||
-        dev->setup_len < 0 ||
-        dev->setup_index > dev->setup_len ||
-        dev->setup_len > sizeof(dev->data_buf)) {
-        return -EINVAL;
-    }
     return 0;
 }
 
@@ -340,8 +334,9 @@ static USBDevice *usb_try_create_simple(USBBus *bus, const char *name,
     }
     object_property_set_bool(OBJECT(dev), true, "realized", &err);
     if (err) {
-        error_propagate(errp, err);
-        error_prepend(errp, "Failed to initialize USB device '%s': ", name);
+        error_propagate_prepend(errp, err,
+                                "Failed to initialize USB device '%s': ",
+                                name);
         return NULL;
     }
     return dev;

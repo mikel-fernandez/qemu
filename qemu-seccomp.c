@@ -12,11 +12,12 @@
  * Contributions after 2012-01-13 are licensed under the terms of the
  * GNU GPL, version 2 or (at your option) any later version.
  */
+
 #include "qemu/osdep.h"
+#include "qapi/error.h"
 #include "qemu/config-file.h"
 #include "qemu/option.h"
 #include "qemu/module.h"
-#include "qemu/error-report.h"
 #include <sys/prctl.h>
 #include <seccomp.h>
 #include "sysemu/seccomp.h"
@@ -40,7 +41,8 @@ struct QemuSeccompSyscall {
 };
 
 const struct scmp_arg_cmp sched_setscheduler_arg[] = {
-    SCMP_A1(SCMP_CMP_NE, SCHED_IDLE)
+    /* was SCMP_A1(SCMP_CMP_NE, SCHED_IDLE), but expanded due to GCC 4.x bug */
+    { .arg = 1, .op = SCMP_CMP_NE, .datum_a = SCHED_IDLE }
 };
 
 static const struct QemuSeccompSyscall blacklist[] = {
@@ -190,7 +192,7 @@ int parse_sandbox(void *opaque, QemuOpts *opts, Error **errp)
                  * to provide a little bit of consistency for
                  * the command line */
             } else {
-                error_report("invalid argument for obsolete");
+                error_setg(errp, "invalid argument for obsolete");
                 return -1;
             }
         }
@@ -205,14 +207,13 @@ int parse_sandbox(void *opaque, QemuOpts *opts, Error **errp)
                 /* calling prctl directly because we're
                  * not sure if host has CAP_SYS_ADMIN set*/
                 if (prctl(PR_SET_NO_NEW_PRIVS, 1)) {
-                    error_report("failed to set no_new_privs "
-                                 "aborting");
+                    error_setg(errp, "failed to set no_new_privs aborting");
                     return -1;
                 }
             } else if (g_str_equal(value, "allow")) {
                 /* default value */
             } else {
-                error_report("invalid argument for elevateprivileges");
+                error_setg(errp, "invalid argument for elevateprivileges");
                 return -1;
             }
         }
@@ -224,7 +225,7 @@ int parse_sandbox(void *opaque, QemuOpts *opts, Error **errp)
             } else if (g_str_equal(value, "allow")) {
                 /* default value */
             } else {
-                error_report("invalid argument for spawn");
+                error_setg(errp, "invalid argument for spawn");
                 return -1;
             }
         }
@@ -236,14 +237,14 @@ int parse_sandbox(void *opaque, QemuOpts *opts, Error **errp)
             } else if (g_str_equal(value, "allow")) {
                 /* default value */
             } else {
-                error_report("invalid argument for resourcecontrol");
+                error_setg(errp, "invalid argument for resourcecontrol");
                 return -1;
             }
         }
 
         if (seccomp_start(seccomp_opts) < 0) {
-            error_report("failed to install seccomp syscall filter "
-                         "in the kernel");
+            error_setg(errp, "failed to install seccomp syscall filter "
+                       "in the kernel");
             return -1;
         }
     }
@@ -282,7 +283,24 @@ static QemuOptsList qemu_sandbox_opts = {
 
 static void seccomp_register(void)
 {
-    qemu_add_opts(&qemu_sandbox_opts);
+    bool add = false;
+
+    /* FIXME: use seccomp_api_get() >= 2 check when released */
+
+#if defined(SECCOMP_FILTER_FLAG_TSYNC)
+    int check;
+
+    /* check host TSYNC capability, it returns errno == ENOSYS if unavailable */
+    check = qemu_seccomp(SECCOMP_SET_MODE_FILTER,
+                         SECCOMP_FILTER_FLAG_TSYNC, NULL);
+    if (check < 0 && errno == EFAULT) {
+        add = true;
+    }
+#endif
+
+    if (add) {
+        qemu_add_opts(&qemu_sandbox_opts);
+    }
 }
 opts_init(seccomp_register);
 #endif

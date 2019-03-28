@@ -110,9 +110,8 @@ void blk_iostatus_disable(BlockBackend *blk);
 void blk_iostatus_reset(BlockBackend *blk);
 void blk_iostatus_set_err(BlockBackend *blk, int error);
 int blk_attach_dev(BlockBackend *blk, DeviceState *dev);
-void blk_attach_dev_legacy(BlockBackend *blk, void *dev);
-void blk_detach_dev(BlockBackend *blk, void *dev);
-void *blk_get_attached_dev(BlockBackend *blk);
+void blk_detach_dev(BlockBackend *blk, DeviceState *dev);
+DeviceState *blk_get_attached_dev(BlockBackend *blk);
 char *blk_get_attached_dev_id(BlockBackend *blk);
 BlockBackend *blk_by_dev(void *dev);
 BlockBackend *blk_by_qdev_id(const char *id, Error **errp);
@@ -157,6 +156,8 @@ int blk_co_pdiscard(BlockBackend *blk, int64_t offset, int bytes);
 int blk_co_flush(BlockBackend *blk);
 int blk_flush(BlockBackend *blk);
 int blk_commit_all(void);
+void blk_inc_in_flight(BlockBackend *blk);
+void blk_dec_in_flight(BlockBackend *blk);
 void blk_drain(BlockBackend *blk);
 void blk_drain_all(void);
 void blk_set_on_error(BlockBackend *blk, BlockdevOnError on_read_error,
@@ -166,9 +167,9 @@ BlockErrorAction blk_get_error_action(BlockBackend *blk, bool is_read,
                                       int error);
 void blk_error_action(BlockBackend *blk, BlockErrorAction action,
                       bool is_read, int error);
-int blk_is_read_only(BlockBackend *blk);
-int blk_is_sg(BlockBackend *blk);
-int blk_enable_write_cache(BlockBackend *blk);
+bool blk_is_read_only(BlockBackend *blk);
+bool blk_is_sg(BlockBackend *blk);
+bool blk_enable_write_cache(BlockBackend *blk);
 void blk_set_enable_write_cache(BlockBackend *blk, bool wce);
 void blk_invalidate_cache(BlockBackend *blk, Error **errp);
 bool blk_is_inserted(BlockBackend *blk);
@@ -236,5 +237,7 @@ int coroutine_fn blk_co_copy_range(BlockBackend *blk_in, int64_t off_in,
                                    BlockBackend *blk_out, int64_t off_out,
                                    int bytes, BdrvRequestFlags read_flags,
                                    BdrvRequestFlags write_flags);
+
+const BdrvChild *blk_root(BlockBackend *blk);
 
 #endif

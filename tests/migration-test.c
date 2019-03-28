@@ -20,12 +20,17 @@
 #include "qemu/sockets.h"
 #include "chardev/char.h"
 #include "sysemu/sysemu.h"
+#include "qapi/qapi-visit-sockets.h"
+#include "qapi/qobject-input-visitor.h"
+#include "qapi/qobject-output-visitor.h"
+
+#include "migration/migration-test.h"
 
 /* TODO actually test the results and get rid of this */
 #define qtest_qmp_discard_response(...) qobject_unref(qtest_qmp(__VA_ARGS__))
 
-const unsigned start_address = 1024 * 1024;
-const unsigned end_address = 100 * 1024 * 1024;
+unsigned start_address;
+unsigned end_address;
 bool got_stop;
 static bool uffd_feature_thread_id;
 
@@ -80,16 +85,28 @@ static bool ufd_version_check(void)
 
 static const char *tmpfs;
 
-/* A simple PC boot sector that modifies memory (1-100MB) quickly
- * outputting a 'B' every so often if it's still running.
+/* The boot file modifies memory area in [start_address, end_address)
+ * repeatedly. It outputs a 'B' at a fixed rate while it's still running.
  */
-#include "tests/migration/x86-a-b-bootblock.h"
+#include "tests/migration/i386/a-b-bootblock.h"
+#include "tests/migration/aarch64/a-b-kernel.h"
 
-static void init_bootfile_x86(const char *bootpath)
+static void init_bootfile(const char *bootpath, void *content)
 {
     FILE *bootfile = fopen(bootpath, "wb");
 
-    g_assert_cmpint(fwrite(x86_bootsect, 512, 1, bootfile), ==, 1);
+    g_assert_cmpint(fwrite(content, 512, 1, bootfile), ==, 1);
+    fclose(bootfile);
+}
+
+#include "tests/migration/s390x/a-b-bios.h"
+
+static void init_bootfile_s390x(const char *bootpath)
+{
+    FILE *bootfile = fopen(bootpath, "wb");
+    size_t len = sizeof(s390x_elf);
+
+    g_assert_cmpint(fwrite(s390x_elf, len, 1, bootfile), ==, 1);
     fclose(bootfile);
 }
 
@@ -201,10 +218,10 @@ static gchar *migrate_query_status(QTestState *who)
  * events suddenly appearing confuse the qmp()/hmp() responses.
  */
 
-static uint64_t get_migration_pass(QTestState *who)
+static int64_t read_ram_property_int(QTestState *who, const char *property)
 {
     QDict *rsp_return, *rsp_ram;
-    uint64_t result;
+    int64_t result;
 
     rsp_return = migrate_query(who);
     if (!qdict_haskey(rsp_return, "ram")) {
@@ -212,10 +229,15 @@ static uint64_t get_migration_pass(QTestState *who)
         result = 0;
     } else {
         rsp_ram = qdict_get_qdict(rsp_return, "ram");
-        result = qdict_get_try_int(rsp_ram, "dirty-sync-count", 0);
+        result = qdict_get_try_int(rsp_ram, property, 0);
     }
     qobject_unref(rsp_return);
     return result;
+}
+
+static uint64_t get_migration_pass(QTestState *who)
+{
+    return read_ram_property_int(who, "dirty-sync-count");
 }
 
 static void read_blocktime(QTestState *who)
@@ -270,11 +292,11 @@ static void wait_for_migration_pass(QTestState *who)
 static void check_guests_ram(QTestState *who)
 {
     /* Our ASM test will have been incrementing one byte from each page from
-     * 1MB to <100MB in order.
-     * This gives us a constraint that any page's byte should be equal or less
-     * than the previous pages byte (mod 256); and they should all be equal
-     * except for one transition at the point where we meet the incrementer.
-     * (We're running this with the guest stopped).
+     * start_address to < end_address in order. This gives us a constraint
+     * that any page's byte should be equal or less than the previous pages
+     * byte (mod 256); and they should all be equal except for one transition
+     * at the point where we meet the incrementer. (We're running this with
+     * the guest stopped).
      */
     unsigned address;
     uint8_t first_byte;
@@ -285,7 +307,8 @@ static void check_guests_ram(QTestState *who)
     qtest_memread(who, start_address, &first_byte, 1);
     last_byte = first_byte;
 
-    for (address = start_address + 4096; address < end_address; address += 4096)
+    for (address = start_address + TEST_MEM_PAGE_SIZE; address < end_address;
+         address += TEST_MEM_PAGE_SIZE)
     {
         uint8_t b;
         qtest_memread(who, address, &b, 1);
@@ -317,15 +340,76 @@ static void cleanup(const char *filename)
     g_free(path);
 }
 
+static char *get_shmem_opts(const char *mem_size, const char *shmem_path)
+{
+    return g_strdup_printf("-object memory-backend-file,id=mem0,size=%s"
+                           ",mem-path=%s,share=on -numa node,memdev=mem0",
+                           mem_size, shmem_path);
+}
+
+static char *SocketAddress_to_str(SocketAddress *addr)
+{
+    switch (addr->type) {
+    case SOCKET_ADDRESS_TYPE_INET:
+        return g_strdup_printf("tcp:%s:%s",
+                               addr->u.inet.host,
+                               addr->u.inet.port);
+    case SOCKET_ADDRESS_TYPE_UNIX:
+        return g_strdup_printf("unix:%s",
+                               addr->u.q_unix.path);
+    case SOCKET_ADDRESS_TYPE_FD:
+        return g_strdup_printf("fd:%s", addr->u.fd.str);
+    case SOCKET_ADDRESS_TYPE_VSOCK:
+        return g_strdup_printf("tcp:%s:%s",
+                               addr->u.vsock.cid,
+                               addr->u.vsock.port);
+    default:
+        return g_strdup("unknown address type");
+    }
+}
+
+static char *migrate_get_socket_address(QTestState *who, const char *parameter)
+{
+    QDict *rsp;
+    char *result;
+    Error *local_err = NULL;
+    SocketAddressList *addrs;
+    Visitor *iv = NULL;
+    QObject *object;
+
+    rsp = migrate_query(who);
+    object = qdict_get(rsp, parameter);
+
+    iv = qobject_input_visitor_new(object);
+    visit_type_SocketAddressList(iv, NULL, &addrs, &local_err);
+    visit_free(iv);
+
+    /* we are only using a single address */
+    result = SocketAddress_to_str(addrs->value);
+
+    qapi_free_SocketAddressList(addrs);
+    qobject_unref(rsp);
+    return result;
+}
+
+static long long migrate_get_parameter(QTestState *who, const char *parameter)
+{
+    QDict *rsp;
+    long long result;
+
+    rsp = wait_command(who, "{ 'execute': 'query-migrate-parameters' }");
+    result = qdict_get_int(rsp, parameter);
+    qobject_unref(rsp);
+    return result;
+}
+
 static void migrate_check_parameter(QTestState *who, const char *parameter,
                                     long long value)
 {
-    QDict *rsp_return;
+    long long result;
 
-    rsp_return = wait_command(who,
-                              "{ 'execute': 'query-migrate-parameters' }");
-    g_assert_cmpint(qdict_get_int(rsp_return, parameter), ==, value);
-    qobject_unref(rsp_return);
+    result = migrate_get_parameter(who, parameter);
+    g_assert_cmpint(result, ==, value);
 }
 
 static void migrate_set_parameter(QTestState *who, const char *parameter,
@@ -415,47 +499,106 @@ static void migrate_postcopy_start(QTestState *from, QTestState *to)
 }
 
 static int test_migrate_start(QTestState **from, QTestState **to,
-                               const char *uri, bool hide_stderr)
+                               const char *uri, bool hide_stderr,
+                               bool use_shmem)
 {
     gchar *cmd_src, *cmd_dst;
-    char *bootpath = g_strdup_printf("%s/bootsect", tmpfs);
+    char *bootpath = NULL;
+    char *extra_opts = NULL;
+    char *shmem_path = NULL;
     const char *arch = qtest_get_arch();
     const char *accel = "kvm:tcg";
 
-    got_stop = false;
+    if (use_shmem) {
+        if (!g_file_test("/dev/shm", G_FILE_TEST_IS_DIR)) {
+            g_test_skip("/dev/shm is not supported");
+            return -1;
+        }
+        shmem_path = g_strdup_printf("/dev/shm/qemu-%d", getpid());
+    }
 
+    got_stop = false;
+    bootpath = g_strdup_printf("%s/bootsect", tmpfs);
     if (strcmp(arch, "i386") == 0 || strcmp(arch, "x86_64") == 0) {
-        init_bootfile_x86(bootpath);
+        init_bootfile(bootpath, x86_bootsect);
+        extra_opts = use_shmem ? get_shmem_opts("150M", shmem_path) : NULL;
         cmd_src = g_strdup_printf("-machine accel=%s -m 150M"
                                   " -name source,debug-threads=on"
                                   " -serial file:%s/src_serial"
-                                  " -drive file=%s,format=raw",
-                                  accel, tmpfs, bootpath);
+                                  " -drive file=%s,format=raw %s",
+                                  accel, tmpfs, bootpath,
+                                  extra_opts ? extra_opts : "");
         cmd_dst = g_strdup_printf("-machine accel=%s -m 150M"
                                   " -name target,debug-threads=on"
                                   " -serial file:%s/dest_serial"
                                   " -drive file=%s,format=raw"
-                                  " -incoming %s",
-                                  accel, tmpfs, bootpath, uri);
+                                  " -incoming %s %s",
+                                  accel, tmpfs, bootpath, uri,
+                                  extra_opts ? extra_opts : "");
+        start_address = X86_TEST_MEM_START;
+        end_address = X86_TEST_MEM_END;
+    } else if (g_str_equal(arch, "s390x")) {
+        init_bootfile_s390x(bootpath);
+        extra_opts = use_shmem ? get_shmem_opts("128M", shmem_path) : NULL;
+        cmd_src = g_strdup_printf("-machine accel=%s -m 128M"
+                                  " -name source,debug-threads=on"
+                                  " -serial file:%s/src_serial -bios %s %s",
+                                  accel, tmpfs, bootpath,
+                                  extra_opts ? extra_opts : "");
+        cmd_dst = g_strdup_printf("-machine accel=%s -m 128M"
+                                  " -name target,debug-threads=on"
+                                  " -serial file:%s/dest_serial -bios %s"
+                                  " -incoming %s %s",
+                                  accel, tmpfs, bootpath, uri,
+                                  extra_opts ? extra_opts : "");
+        start_address = S390_TEST_MEM_START;
+        end_address = S390_TEST_MEM_END;
     } else if (strcmp(arch, "ppc64") == 0) {
-        cmd_src = g_strdup_printf("-machine accel=%s -m 256M"
+        extra_opts = use_shmem ? get_shmem_opts("256M", shmem_path) : NULL;
+        cmd_src = g_strdup_printf("-machine accel=%s -m 256M -nodefaults"
                                   " -name source,debug-threads=on"
                                   " -serial file:%s/src_serial"
-                                  " -prom-env '"
-                                  "boot-command=hex .\" _\" begin %x %x "
+                                  " -prom-env 'use-nvramrc?=true' -prom-env "
+                                  "'nvramrc=hex .\" _\" begin %x %x "
                                   "do i c@ 1 + i c! 1000 +loop .\" B\" 0 "
-                                  "until'",  accel, tmpfs, end_address,
-                                  start_address);
+                                  "until' %s",  accel, tmpfs, end_address,
+                                  start_address, extra_opts ? extra_opts : "");
         cmd_dst = g_strdup_printf("-machine accel=%s -m 256M"
                                   " -name target,debug-threads=on"
                                   " -serial file:%s/dest_serial"
-                                  " -incoming %s",
-                                  accel, tmpfs, uri);
+                                  " -incoming %s %s",
+                                  accel, tmpfs, uri,
+                                  extra_opts ? extra_opts : "");
+
+        start_address = PPC_TEST_MEM_START;
+        end_address = PPC_TEST_MEM_END;
+    } else if (strcmp(arch, "aarch64") == 0) {
+        init_bootfile(bootpath, aarch64_kernel);
+        extra_opts = use_shmem ? get_shmem_opts("150M", shmem_path) : NULL;
+        cmd_src = g_strdup_printf("-machine virt,accel=%s,gic-version=max "
+                                  "-name vmsource,debug-threads=on -cpu max "
+                                  "-m 150M -serial file:%s/src_serial "
+                                  "-kernel %s %s",
+                                  accel, tmpfs, bootpath,
+                                  extra_opts ? extra_opts : "");
+        cmd_dst = g_strdup_printf("-machine virt,accel=%s,gic-version=max "
+                                  "-name vmdest,debug-threads=on -cpu max "
+                                  "-m 150M -serial file:%s/dest_serial "
+                                  "-kernel %s "
+                                  "-incoming %s %s",
+                                  accel, tmpfs, bootpath, uri,
+                                  extra_opts ? extra_opts : "");
+
+        start_address = ARM_TEST_MEM_START;
+        end_address = ARM_TEST_MEM_END;
+
+        g_assert(sizeof(aarch64_kernel) <= ARM_TEST_MAX_KERNEL_SIZE);
     } else {
         g_assert_not_reached();
     }
 
     g_free(bootpath);
+    g_free(extra_opts);
 
     if (hide_stderr) {
         gchar *tmp;
@@ -473,6 +616,16 @@ static int test_migrate_start(QTestState **from, QTestState **to,
 
     *to = qtest_init(cmd_dst);
     g_free(cmd_dst);
+
+    /*
+     * Remove shmem file immediately to avoid memory leak in test failed case.
+     * It's valid becase QEMU has already opened this file
+     */
+    if (use_shmem) {
+        unlink(shmem_path);
+        g_free(shmem_path);
+    }
+
     return 0;
 }
 
@@ -533,14 +686,26 @@ static void deprecated_set_speed(QTestState *who, long long value)
     migrate_check_parameter(who, "max-bandwidth", value);
 }
 
+static void deprecated_set_cache_size(QTestState *who, long long value)
+{
+    QDict *rsp;
+
+    rsp = qtest_qmp(who, "{ 'execute': 'migrate-set-cache-size',"
+                         "'arguments': { 'value': %lld } }", value);
+    g_assert(qdict_haskey(rsp, "return"));
+    qobject_unref(rsp);
+    migrate_check_parameter(who, "xbzrle-cache-size", value);
+}
+
 static void test_deprecated(void)
 {
     QTestState *from;
 
-    from = qtest_start("");
+    from = qtest_start("-machine none");
 
     deprecated_set_downtime(from, 0.12345);
     deprecated_set_speed(from, 12345);
+    deprecated_set_cache_size(from, 4096);
 
     qtest_quit(from);
 }
@@ -552,7 +717,7 @@ static int migrate_postcopy_prepare(QTestState **from_ptr,
     char *uri = g_strdup_printf("unix:%s/migsocket", tmpfs);
     QTestState *from, *to;
 
-    if (test_migrate_start(&from, &to, uri, hide_error)) {
+    if (test_migrate_start(&from, &to, uri, hide_error, false)) {
         return -1;
     }
 
@@ -669,7 +834,7 @@ static void test_baddest(void)
     char *status;
     bool failed;
 
-    if (test_migrate_start(&from, &to, "tcp:0:0", true)) {
+    if (test_migrate_start(&from, &to, "tcp:0:0", true, false)) {
         return;
     }
     migrate(from, "tcp:0:0", "{}");
@@ -694,7 +859,7 @@ static void test_precopy_unix(void)
     char *uri = g_strdup_printf("unix:%s/migsocket", tmpfs);
     QTestState *from, *to;
 
-    if (test_migrate_start(&from, &to, uri, false)) {
+    if (test_migrate_start(&from, &to, uri, false, false)) {
         return;
     }
 
@@ -730,6 +895,138 @@ static void test_precopy_unix(void)
     g_free(uri);
 }
 
+#if 0
+/* Currently upset on aarch64 TCG */
+static void test_ignore_shared(void)
+{
+    char *uri = g_strdup_printf("unix:%s/migsocket", tmpfs);
+    QTestState *from, *to;
+
+    if (test_migrate_start(&from, &to, uri, false, true)) {
+        return;
+    }
+
+    migrate_set_capability(from, "x-ignore-shared", true);
+    migrate_set_capability(to, "x-ignore-shared", true);
+
+    /* Wait for the first serial output from the source */
+    wait_for_serial("src_serial");
+
+    migrate(from, uri, "{}");
+
+    wait_for_migration_pass(from);
+
+    if (!got_stop) {
+        qtest_qmp_eventwait(from, "STOP");
+    }
+
+    qtest_qmp_eventwait(to, "RESUME");
+
+    wait_for_serial("dest_serial");
+    wait_for_migration_complete(from);
+
+    /* Check whether shared RAM has been really skipped */
+    g_assert_cmpint(read_ram_property_int(from, "transferred"), <, 1024 * 1024);
+
+    test_migrate_end(from, to, true);
+    g_free(uri);
+}
+#endif
+
+static void test_xbzrle(const char *uri)
+{
+    QTestState *from, *to;
+
+    if (test_migrate_start(&from, &to, uri, false, false)) {
+        return;
+    }
+
+    /*
+     * We want to pick a speed slow enough that the test completes
+     * quickly, but that it doesn't complete precopy even on a slow
+     * machine, so also set the downtime.
+     */
+    /* 1 ms should make it not converge*/
+    migrate_set_parameter(from, "downtime-limit", 1);
+    /* 1GB/s */
+    migrate_set_parameter(from, "max-bandwidth", 1000000000);
+
+    migrate_set_parameter(from, "xbzrle-cache-size", 33554432);
+
+    migrate_set_capability(from, "xbzrle", "true");
+    migrate_set_capability(to, "xbzrle", "true");
+    /* Wait for the first serial output from the source */
+    wait_for_serial("src_serial");
+
+    migrate(from, uri, "{}");
+
+    wait_for_migration_pass(from);
+
+    /* 300ms should converge */
+    migrate_set_parameter(from, "downtime-limit", 300);
+
+    if (!got_stop) {
+        qtest_qmp_eventwait(from, "STOP");
+    }
+    qtest_qmp_eventwait(to, "RESUME");
+
+    wait_for_serial("dest_serial");
+    wait_for_migration_complete(from);
+
+    test_migrate_end(from, to, true);
+}
+
+static void test_xbzrle_unix(void)
+{
+    char *uri = g_strdup_printf("unix:%s/migsocket", tmpfs);
+
+    test_xbzrle(uri);
+    g_free(uri);
+}
+
+static void test_precopy_tcp(void)
+{
+    char *uri;
+    QTestState *from, *to;
+
+    if (test_migrate_start(&from, &to, "tcp:127.0.0.1:0", false, false)) {
+        return;
+    }
+
+    /*
+     * We want to pick a speed slow enough that the test completes
+     * quickly, but that it doesn't complete precopy even on a slow
+     * machine, so also set the downtime.
+     */
+    /* 1 ms should make it not converge*/
+    migrate_set_parameter(from, "downtime-limit", 1);
+    /* 1GB/s */
+    migrate_set_parameter(from, "max-bandwidth", 1000000000);
+
+    /* Wait for the first serial output from the source */
+    wait_for_serial("src_serial");
+
+    uri = migrate_get_socket_address(to, "socket-address");
+
+    migrate(from, uri, "{}");
+
+    wait_for_migration_pass(from);
+
+    /* 300ms should converge */
+    migrate_set_parameter(from, "downtime-limit", 300);
+
+    if (!got_stop) {
+        qtest_qmp_eventwait(from, "STOP");
+    }
+    qtest_qmp_eventwait(to, "RESUME");
+
+    wait_for_serial("dest_serial");
+    wait_for_migration_complete(from);
+
+    test_migrate_end(from, to, true);
+    g_free(uri);
+}
+
 int main(int argc, char **argv)
 {
     char template[] = "/tmp/migration-test-XXXXXX";
@@ -738,7 +1035,7 @@ int main(int argc, char **argv)
     g_test_init(&argc, &argv, NULL);
 
     if (!ufd_version_check()) {
-        return 0;
+        return g_test_run();
     }
 
     /*
@@ -749,12 +1046,28 @@ int main(int argc, char **argv)
     if (g_str_equal(qtest_get_arch(), "ppc64") &&
         access("/sys/module/kvm_hv", F_OK)) {
         g_test_message("Skipping test: kvm_hv not available");
-        return 0;
+        return g_test_run();
+    }
+
+    /*
+     * Similar to ppc64, s390x seems to be touchy with TCG, so disable it
+     * there until the problems are resolved
+     */
+    if (g_str_equal(qtest_get_arch(), "s390x")) {
+#if defined(HOST_S390X)
+        if (access("/dev/kvm", R_OK | W_OK)) {
+            g_test_message("Skipping test: kvm not available");
+            return g_test_run();
+        }
+#else
+        g_test_message("Skipping test: Need s390x host to work properly");
+        return g_test_run();
+#endif
     }
 
     tmpfs = mkdtemp(template);
     if (!tmpfs) {
-        g_test_message("mkdtemp on path (%s): %s\n", template, strerror(errno));
+        g_test_message("mkdtemp on path (%s): %s", template, strerror(errno));
     }
     g_assert(tmpfs);
 
@@ -765,6 +1078,9 @@ int main(int argc, char **argv)
     qtest_add_func("/migration/deprecated", test_deprecated);
     qtest_add_func("/migration/bad_dest", test_baddest);
     qtest_add_func("/migration/precopy/unix", test_precopy_unix);
+    qtest_add_func("/migration/precopy/tcp", test_precopy_tcp);
+    /* qtest_add_func("/migration/ignore_shared", test_ignore_shared); */
+    qtest_add_func("/migration/xbzrle/unix", test_xbzrle_unix);
 
     ret = g_test_run();
 
@@ -772,7 +1088,7 @@ int main(int argc, char **argv)
 
     ret = rmdir(tmpfs);
     if (ret != 0) {
-        g_test_message("unable to rmdir: path (%s): %s\n",
+        g_test_message("unable to rmdir: path (%s): %s",
                        tmpfs, strerror(errno));
     }
 

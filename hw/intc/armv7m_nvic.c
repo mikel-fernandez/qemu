@@ -1055,17 +1055,17 @@ static uint32_t nvic_readl(NVICState *s, uint32_t offset, MemTxAttrs attrs)
     case 0xd5c: /* MMFR3.  */
         return cpu->id_mmfr3;
     case 0xd60: /* ISAR0.  */
-        return cpu->id_isar0;
+        return cpu->isar.id_isar0;
     case 0xd64: /* ISAR1.  */
-        return cpu->id_isar1;
+        return cpu->isar.id_isar1;
     case 0xd68: /* ISAR2.  */
-        return cpu->id_isar2;
+        return cpu->isar.id_isar2;
     case 0xd6c: /* ISAR3.  */
-        return cpu->id_isar3;
+        return cpu->isar.id_isar3;
     case 0xd70: /* ISAR4.  */
-        return cpu->id_isar4;
+        return cpu->isar.id_isar4;
     case 0xd74: /* ISAR5.  */
-        return cpu->id_isar5;
+        return cpu->isar.id_isar5;
     case 0xd78: /* CLIDR */
         return cpu->clidr;
     case 0xd7c: /* CTR */
@@ -1841,7 +1841,7 @@ static MemTxResult nvic_sysreg_read(void *opaque, hwaddr addr,
             }
         }
         break;
-    case 0xd18: /* System Handler Priority (SHPR1) */
+    case 0xd18 ... 0xd1b: /* System Handler Priority (SHPR1) */
         if (!arm_feature(&s->cpu->env, ARM_FEATURE_M_MAIN)) {
             val = 0;
             break;
@@ -1956,7 +1956,7 @@ static MemTxResult nvic_sysreg_write(void *opaque, hwaddr addr,
         }
         nvic_irq_update(s);
         return MEMTX_OK;
-    case 0xd18: /* System Handler Priority (SHPR1) */
+    case 0xd18 ... 0xd1b: /* System Handler Priority (SHPR1) */
         if (!arm_feature(&s->cpu->env, ARM_FEATURE_M_MAIN)) {
             return MEMTX_OK;
         }
@@ -2274,8 +2274,7 @@ static void armv7m_nvic_realize(DeviceState *dev, Error **errp)
     Error *err = NULL;
     int regionlen;
 
-    s->cpu = ARM_CPU(qemu_get_cpu(0));
-
+    /* The armv7m container object will have set our CPU pointer */
     if (!s->cpu || !arm_feature(&s->cpu->env, ARM_FEATURE_M)) {
         error_setg(errp, "The NVIC can only be used with a Cortex-M CPU");
         return;

@@ -6,7 +6,7 @@
  * This library is free software; you can redistribute it and/or
  * modify it under the terms of the GNU Lesser General Public
  * License as published by the Free Software Foundation; either
- * version 2 of the License, or (at your option) any later version.
+ * version 2.1 of the License, or (at your option) any later version.
  *
  * This library is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
@@ -16,11 +16,7 @@
  * You should have received a copy of the GNU Lesser General Public
  * License along with this library; if not, see <http://www.gnu.org/licenses/>.
  */
-#ifdef _WIN32
-#include <windows.h>
-#endif
 #include "qemu/osdep.h"
-
 
 #include "qemu-common.h"
 #define NO_CPU_IO_DEFS
@@ -1282,8 +1278,7 @@ void tb_flush(CPUState *cpu)
  */
 #ifdef CONFIG_USER_ONLY
 
-static void
-do_tb_invalidate_check(struct qht *ht, void *p, uint32_t hash, void *userp)
+static void do_tb_invalidate_check(void *p, uint32_t hash, void *userp)
 {
     TranslationBlock *tb = p;
     target_ulong addr = *(target_ulong *)userp;
@@ -1304,8 +1299,7 @@ static void tb_invalidate_check(target_ulong address)
     qht_iter(&tb_ctx.htable, do_tb_invalidate_check, &address);
 }
 
-static void
-do_tb_page_check(struct qht *ht, void *p, uint32_t hash, void *userp)
+static void do_tb_page_check(void *p, uint32_t hash, void *userp)
 {
     TranslationBlock *tb = p;
     int flags1, flags2;
@@ -1694,6 +1688,9 @@ TranslationBlock *tb_gen_code(CPUState *cpu,
         cflags |= CF_NOCACHE | 1;
     }
 
+    cflags &= ~CF_CLUSTER_MASK;
+    cflags |= cpu->cluster_index << CF_CLUSTER_SHIFT;
+
  buffer_overflow:
     tb = tb_alloc(pc);
     if (unlikely(!tb)) {
@@ -2011,15 +2008,6 @@ void tb_invalidate_phys_page_fast(struct page_collection *pages,
 {
     PageDesc *p;
 
-#if 0
-    if (1) {
-        qemu_log("modifying code at 0x%x size=%d EIP=%x PC=%08x\n",
-                  cpu_single_env->mem_io_vaddr, len,
-                  cpu_single_env->eip,
-                  cpu_single_env->eip +
-                  (intptr_t)cpu_single_env->segs[R_CS].base);
-    }
-#endif
     assert_memory_lock();
 
     p = page_find(start >> TARGET_PAGE_BITS);
@@ -2301,7 +2289,7 @@ void dump_exec_info(FILE *f, fprintf_function cpu_fprintf)
 {
     struct tb_tree_stats tst = {};
     struct qht_stats hst;
-    size_t nb_tbs;
+    size_t nb_tbs, flush_full, flush_part, flush_elide;
 
     tcg_tb_foreach(tb_tree_stats_iter, &tst);
     nb_tbs = tst.nb_tbs;
@@ -2337,7 +2325,11 @@ void dump_exec_info(FILE *f, fprintf_function cpu_fprintf)
     cpu_fprintf(f, "TB flush count      %u\n",
                 atomic_read(&tb_ctx.tb_flush_count));
     cpu_fprintf(f, "TB invalidate count %zu\n", tcg_tb_phys_invalidate_count());
-    cpu_fprintf(f, "TLB flush count     %zu\n", tlb_flush_count());
+
+    tlb_flush_counts(&flush_full, &flush_part, &flush_elide);
+    cpu_fprintf(f, "TLB full flushes    %zu\n", flush_full);
+    cpu_fprintf(f, "TLB partial flushes %zu\n", flush_part);
+    cpu_fprintf(f, "TLB elided flushes  %zu\n", flush_elide);
     tcg_dump_info(f, cpu_fprintf);
 }
 
@@ -2352,7 +2344,7 @@ void cpu_interrupt(CPUState *cpu, int mask)
 {
     g_assert(qemu_mutex_iothread_locked());
     cpu->interrupt_request |= mask;
-    cpu->icount_decr.u16.high = -1;
+    atomic_set(&cpu->icount_decr.u16.high, -1);
 }
 
 /*

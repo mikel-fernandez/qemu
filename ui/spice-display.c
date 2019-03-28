@@ -674,10 +674,28 @@ static int interface_client_monitors_config(QXLInstance *sin,
 
     memset(&info, 0, sizeof(info));
 
-    head = qemu_console_get_head(ssd->dcl.con);
-    if (mc->num_of_monitors > head) {
-        info.width  = mc->monitors[head].width;
-        info.height = mc->monitors[head].height;
+    if (mc->num_of_monitors == 1) {
+        /*
+         * New spice-server version which filters the list of monitors
+         * to only include those that belong to our display channel.
+         *
+         * single-head configuration (where filtering doesn't matter)
+         * takes this code path too.
+         */
+        info.width  = mc->monitors[0].width;
+        info.height = mc->monitors[0].height;
+    } else {
+        /*
+         * Old spice-server which gives us all monitors, so we have to
+         * figure ourself which entry we need.  Array index is the
+         * channel_id, which is the qemu console index, see
+         * qemu_spice_add_display_interface().
+         */
+        head = qemu_console_get_index(ssd->dcl.con);
+        if (mc->num_of_monitors > head) {
+            info.width  = mc->monitors[head].width;
+            info.height = mc->monitors[head].height;
+        }
     }
 
     trace_qemu_spice_ui_info(ssd->qxl.id, info.width, info.height);
@@ -1072,7 +1090,7 @@ static void qemu_spice_gl_update(DisplayChangeListener *dcl,
         egl_texture_blit(ssd->gls, &ssd->blit_fb, &ssd->guest_fb,
                          !y_0_top);
         egl_texture_blend(ssd->gls, &ssd->blit_fb, &ssd->cursor_fb,
-                          !y_0_top, x, y);
+                          !y_0_top, x, y, 1.0, 1.0);
         glFlush();
     }
 
@@ -1129,6 +1147,17 @@ static void qemu_spice_display_init_one(QemuConsole *con)
 
     ssd->qxl.base.sif = &dpy_interface.base;
     qemu_spice_add_display_interface(&ssd->qxl, con);
+
+#if SPICE_SERVER_VERSION >= 0x000e02 /* release 0.14.2 */
+    char device_address[256] = "";
+    if (qemu_spice_fill_device_address(con, device_address, 256)) {
+        spice_qxl_set_device_info(&ssd->qxl,
+                                  device_address,
+                                  qemu_console_get_head(con),
+                                  1);
+    }
+#endif
+
     qemu_spice_create_host_memslot(ssd);
 
     register_displaychangelistener(&ssd->dcl);
